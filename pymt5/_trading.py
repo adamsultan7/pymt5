@@ -30,12 +30,14 @@ from pymt5.constants import (
     ORDER_TIME_SPECIFIED_DAY,
     ORDER_TYPE_BUY_STOP_LIMIT,
     ORDER_TYPE_SELL_STOP_LIMIT,
+    PROP_BYTES,
     PROP_F64,
     PROP_FIXED_STRING,
     PROP_U32,
     PROP_U64,
     TRADE_ACTION_CLOSE_BY,
     TRADE_ACTION_DEAL,
+    TRADE_ACTION_MARKET_DEAL,
     TRADE_ACTION_MODIFY,
     TRADE_ACTION_PENDING,
     TRADE_ACTION_REMOVE,
@@ -392,9 +394,9 @@ class _TradingMixin:
         position_by: int = 0,
         time_expiration: int = 0,
     ) -> TradeResult:
-        if trade_action in (TRADE_ACTION_DEAL, TRADE_ACTION_PENDING) and volume <= 0:
+        if trade_action in (TRADE_ACTION_DEAL, TRADE_ACTION_MARKET_DEAL, TRADE_ACTION_PENDING) and volume <= 0:
             raise ValidationError(f"volume must be > 0 for trade_action={trade_action}, got {volume}")
-        if trade_action == TRADE_ACTION_DEAL and price_order <= 0.0:
+        if trade_action in (TRADE_ACTION_DEAL, TRADE_ACTION_MARKET_DEAL) and price_order <= 0.0:
             logger.debug("market order with price_order=0; server will use current price")
         if trade_action == TRADE_ACTION_PENDING and price_order <= 0.0:
             raise ValidationError(f"price_order must be > 0 for pending orders, got {price_order}")
@@ -431,6 +433,10 @@ class _TradingMixin:
                 (PROP_F64, price_sl),
                 (PROP_F64, price_tp),
                 (PROP_U64, deviation),
+                # Build 6090+ reserves 12 bytes here (observed as zeros in
+                # official web UI captures). Without them the server drops
+                # the request and comment/position_id misalign.
+                (PROP_BYTES, bytes(12)),
                 (PROP_FIXED_STRING, comment[:32], 64),
                 (PROP_U64, position_id),
                 (PROP_U64, position_by),
