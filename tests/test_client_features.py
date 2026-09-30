@@ -690,6 +690,48 @@ def test_parse_rate_bars_standard_still_works():
     assert "real_volume" not in bars[0]
 
 
+def _std_bar(ts, base=1.13374):
+    return struct.pack("<iddddqi", ts, base, base + 0.001, base - 0.001, base + 0.0005, 100, 5)
+
+
+def test_parse_rate_bars_seven_std_bars_not_misparsed_as_ext():
+    """Regression: 7x48B STD bars = 336B, divisible by the 56B EXT stride.
+
+    The old len%56 selector parsed these at the wrong stride: bar 0 looked
+    fine (shared layout prefix) and every later bar was misaligned garbage
+    (denormal-tiny / astronomic closes). Seen live on a broker feed.
+    """
+    body = b"".join(_std_bar(1773293460 + i * 3600) for i in range(7))
+    bars = _parse_rate_bars(body)
+    assert len(bars) == 7
+    for i, bar in enumerate(bars):
+        assert bar["time"] == 1773293460 + i * 3600
+        assert bar["close"] == pytest.approx(1.13424)
+        assert "real_volume" not in bar
+
+
+def test_parse_rate_bars_fourteen_std_bars():
+    body = b"".join(_std_bar(1773293460 + i * 3600) for i in range(14))
+    bars = _parse_rate_bars(body)
+    assert len(bars) == 14
+    assert [b["time"] for b in bars] == [1773293460 + i * 3600 for i in range(14)]
+
+
+def test_parse_rate_bars_six_ext_bars_preferred_over_seven_garbage_std():
+    """Reverse ambiguity: 6x56B EXT bars = 336B, also divisible by 48.
+
+    A naive STD parse yields 7 bars of misaligned garbage; validation must
+    pick the 6 valid EXT bars instead.
+    """
+    body = b"".join(
+        struct.pack("<iddddqiq", 1773293460 + i * 3600, 1.15, 1.16, 1.14, 1.155, 100, 5, 50000) for i in range(6)
+    )
+    bars = _parse_rate_bars(body)
+    assert len(bars) == 6
+    assert bars[0]["time"] == 1773293460
+    assert bars[0]["real_volume"] == 50000
+
+
 # ---- Close Position Direction Detection ----
 
 

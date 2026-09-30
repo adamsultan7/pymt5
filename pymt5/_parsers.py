@@ -6,7 +6,9 @@ coercion, and validation logic used by the client mixins.
 
 from __future__ import annotations
 
+import math
 import struct
+import time
 from datetime import datetime
 from fnmatch import fnmatchcase
 
@@ -542,25 +544,84 @@ def _parse_open_account_result(body: bytes | None) -> OpenAccountResult:
     )
 
 
-def _parse_rate_bars(body: bytes | None) -> RecordList:
-    if not body:
-        return []
-    bar_size_std = get_series_size(RATE_BAR_SCHEMA)
-    bar_size_ext = get_series_size(RATE_BAR_SCHEMA_EXT)
-    if len(body) % bar_size_ext == 0 and bar_size_ext != bar_size_std:
-        schema, names, bar_size = RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, bar_size_ext
-    else:
-        schema, names, bar_size = RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, bar_size_std
+#: Earliest plausible bar timestamp (2000-01-01 UTC).
+_MIN_BAR_TS = 946684800
+
+
+def _parse_rate_bars_with(
+    schema: list[dict[str, int]], names: list[str], bar_size: int, body: bytes
+) -> RecordList | None:
+    """Parse ``body`` at a fixed stride; None when a bar fails to decode."""
     count = len(body) // bar_size
     bars = []
     offset = 0
     for _ in range(count):
         if offset + bar_size > len(body):
             break
-        vals = SeriesCodec.parse_at(body, schema, offset)
+        try:
+            vals = SeriesCodec.parse_at(body, schema, offset)
+        except Exception:
+            return None
         bars.append(dict(zip(names, vals)))
         offset += bar_size
     return bars
+
+
+def _rate_bars_valid_share(bars: RecordList) -> float:
+    """Share of bars with sane timestamps + OHLC (0.0..1.0)."""
+    if not bars:
+        return 0.0
+    try:
+        now_hi = time.time() + 86400
+    except Exception:
+        now_hi = 4102444800.0
+    good, prev_t = 0, None
+    for bar in bars:
+        try:
+            stamp = int(bar.get("time", 0) or 0)
+            o = float(bar.get("open", 0) or 0)
+            high = float(bar.get("high", 0) or 0)
+            low = float(bar.get("low", 0) or 0)
+            close = float(bar.get("close", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(v) for v in (o, high, low, close)):
+            continue
+        if not (_MIN_BAR_TS <= stamp <= now_hi):
+            continue
+        if not (low > 0 and low <= high and low <= min(o, close) <= max(o, close) <= high):
+            continue
+        if prev_t is not None and stamp < prev_t:
+            continue
+        prev_t = stamp
+        good += 1
+    return good / len(bars)
+
+
+def _parse_rate_bars(body: bytes | None) -> RecordList:
+    if not body:
+        return []
+    bar_size_std = get_series_size(RATE_BAR_SCHEMA)
+    bar_size_ext = get_series_size(RATE_BAR_SCHEMA_EXT)
+    std_ok = len(body) % bar_size_std == 0
+    ext_ok = bar_size_ext != bar_size_std and len(body) % bar_size_ext == 0
+    if std_ok and not ext_ok:
+        return _parse_rate_bars_with(RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, bar_size_std, body) or []
+    if ext_ok and not std_ok:
+        return _parse_rate_bars_with(RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, bar_size_ext, body) or []
+    if ext_ok and std_ok:
+        # Ambiguous stride (48-byte STD layouts hit this whenever the bar
+        # count is a multiple of 7): the layouts are prefix-identical, so a
+        # wrong stride decodes bar 0 fine and garbage afterwards. Parse both
+        # ways and keep the valid one, preferring STD (the documented
+        # terminal format) on ties.
+        std_bars = _parse_rate_bars_with(RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, bar_size_std, body) or []
+        ext_bars = _parse_rate_bars_with(RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, bar_size_ext, body) or []
+        if _rate_bars_valid_share(ext_bars) > _rate_bars_valid_share(std_bars):
+            return ext_bars
+        return std_bars
+    # Ragged tail: historical behavior parsed floor() as STD.
+    return _parse_rate_bars_with(RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, bar_size_std, body) or []
 
 
 def _parse_counted_records(
