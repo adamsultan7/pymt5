@@ -248,6 +248,64 @@ class _PushHandlersMixin:
         self.transport.on(CMD_TRADE_RESULT_PUSH, _handler)
         return _handler
 
+    async def wait_for_trade_result(self, action_id: int, timeout: float = 20.0) -> Record | None:
+        """Wait for the cmd-19 result push echoing ``action_id``.
+
+        Same push the web UI renders: ``trade_order`` carries the executed
+        ticket (0 means the server answered without executing). Returns the
+        push record dict, or None on timeout. Other handlers still receive
+        the push.
+        """
+        import asyncio
+
+        try:
+            want = int(action_id or 0)
+        except (TypeError, ValueError):
+            return None
+        if not want:
+            return None
+        try:
+            limit = max(0.0, float(timeout or 0))
+        except (TypeError, ValueError):
+            limit = 0.0
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        event = asyncio.Event()
+        outcome: list[Record] = []
+
+        def _handler(result: CommandResult) -> None:
+            try:
+                body = result.body
+                action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
+                if len(body) < action_size:
+                    return
+                vals = SeriesCodec.parse(body, TRADE_RESULT_PUSH_SCHEMA)
+                data = dict(zip(TRADE_RESULT_PUSH_FIELD_NAMES, vals))
+                try:
+                    aid = int(data.get("action_id", 0) or 0)
+                except (TypeError, ValueError):
+                    return
+                if aid != want:
+                    return
+                outcome.append(data)
+                loop.call_soon_threadsafe(event.set)
+            except _PARSE_ERRORS:
+                return
+
+        self.transport.on(CMD_TRADE_RESULT_PUSH, _handler)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=limit if limit > 0 else 0.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None
+        finally:
+            try:
+                self.transport.off(CMD_TRADE_RESULT_PUSH, _handler)
+            except Exception:
+                pass
+        return outcome[0] if outcome else None
+
     def on_trade_transaction(self, callback: Callable[[Record], None]) -> Callable:
         """Register callback for trade update push (cmd=10).
 

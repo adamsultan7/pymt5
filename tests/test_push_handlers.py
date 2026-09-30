@@ -1250,3 +1250,95 @@ class TestHandlerReturnValues:
         client = MockClient()
         handler = client.on_trade_transaction(MagicMock())
         assert callable(handler)
+
+
+# ---------------------------------------------------------------------------
+# wait_for_trade_result: event-driven cmd-19 wait
+# ---------------------------------------------------------------------------
+
+
+def _build_trade_result_body(action_id=1005, trade_order=777):
+    """Serialize a cmd-19 push body with the given aid/order."""
+    from pymt5.schemas import TRADE_RESULT_PUSH_FIELD_NAMES
+
+    values = {
+        "action_result_code": 0,
+        "action_id": action_id,
+        "trade_action": 3,
+        "trade_symbol": "EURUSD",
+        "trade_volume": 10000000,
+        "digits": 5,
+        "trade_order": trade_order,
+        "trade_type": 1,
+        "type_filling": 2,
+        "type_time": 0,
+        "type_flags": 2,
+        "type_reason": 0,
+        "price_order": 1.1339,
+        "price_trigger": 0.0,
+        "price_sl": 0.0,
+        "price_tp": 0.0,
+        "deviation": 20,
+        "price_top": 0.0,
+        "price_bottom": 0.0,
+        "comment": "SignalSt1_30",
+    }
+    specs = []
+    for field, name in zip(TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES):
+        spec = dict(field)
+        spec["propValue"] = values.get(name, 0)
+        specs.append(spec)
+    return SeriesCodec.serialize(specs)
+
+
+def _wait_handler(client):
+    """The internal handler wait_for_trade_result registered on transport."""
+    for call in client.transport.on.call_args_list:
+        if call[0][0] == CMD_TRADE_RESULT_PUSH:
+            return call[0][1]
+    raise AssertionError("wait handler not registered")
+
+
+async def test_wait_for_trade_result_resolves_on_matching_push():
+    import asyncio
+
+    client = MockClient()
+    task = asyncio.create_task(client.wait_for_trade_result(1005, timeout=5))
+    await asyncio.sleep(0)
+    handler = _wait_handler(client)
+    handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=_build_trade_result_body(1005, 777)))
+    record = await asyncio.wait_for(task, timeout=5)
+    assert record is not None
+    assert record["action_id"] == 1005
+    assert record["trade_order"] == 777
+    client.transport.off.assert_called_with(CMD_TRADE_RESULT_PUSH, handler)
+
+
+async def test_wait_for_trade_result_ignores_other_aids_then_resolves():
+    import asyncio
+
+    client = MockClient()
+    task = asyncio.create_task(client.wait_for_trade_result(1005, timeout=5))
+    await asyncio.sleep(0)
+    handler = _wait_handler(client)
+    handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=_build_trade_result_body(9999, 111)))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=_build_trade_result_body(1005, 778)))
+    record = await asyncio.wait_for(task, timeout=5)
+    assert record is not None
+    assert record["trade_order"] == 778
+
+
+async def test_wait_for_trade_result_timeout_returns_none():
+    client = MockClient()
+    record = await client.wait_for_trade_result(1005, timeout=0.05)
+    assert record is None
+    assert client.transport.off.called
+
+
+async def test_wait_for_trade_result_rejects_bad_aid_without_subscribing():
+    client = MockClient()
+    assert await client.wait_for_trade_result(0, timeout=1) is None
+    assert await client.wait_for_trade_result("nope", timeout=1) is None
+    assert client.transport.on.call_count == 0
