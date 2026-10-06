@@ -55,8 +55,8 @@ class MT5WebSocketTransport:
         rate_limit: float = 0,
         rate_burst: int = 20,
         metrics: MetricsCollector | None = None,
-        ws_ping_interval: float | None = 20.0,
-        ws_ping_timeout: float | None = 20.0,
+        ws_ping_interval: float | None = None,
+        ws_ping_timeout: float | None = None,
     ):
         self.uri = uri
         self.timeout = timeout
@@ -81,6 +81,14 @@ class MT5WebSocketTransport:
         self._server_build: int = 0
         self._ws_ping_interval = ws_ping_interval
         self._ws_ping_timeout = ws_ping_timeout
+        # Reference-client parity: the official Web Terminal runs in a
+        # browser, which cannot initiate websocket pings, so it never
+        # executes a session over a missed pong. pymt5 defaults to the same
+        # passive posture (ping_interval=None sends nothing, enforces
+        # nothing; server pings are still auto-answered at protocol level).
+        # Liveness is owned 100% by the app-level heartbeat (CMD 51 ping +
+        # staleness rule). Pass explicit ping_interval/ping_timeout values
+        # to opt back into library-level kills.
         self.last_disconnect_reason: str | None = None
 
     @property
@@ -162,7 +170,7 @@ class MT5WebSocketTransport:
         self._state = TransportState.CONNECTING
         self._shutdown_event.clear()
         self.cipher = initial_cipher()
-        logger.info("connecting to %s", self.uri)
+        logger.debug("connecting to %s", self.uri)
         connect_kwargs: dict[str, Any] = {
             "ping_interval": self._ws_ping_interval,
             "ping_timeout": self._ws_ping_timeout,
@@ -212,7 +220,7 @@ class MT5WebSocketTransport:
                 self._metrics.on_connect()
             except Exception:
                 logger.debug("metrics on_connect raised", exc_info=True)
-        logger.info("transport ready (key exchanged)")
+        logger.debug("transport ready (key exchanged)")
 
     async def _cleanup_failed_connect(self) -> None:
         """Release socket/recv-task after a failed handshake; state -> ERROR."""
@@ -229,7 +237,7 @@ class MT5WebSocketTransport:
         self._state = TransportState.ERROR
 
     async def close(self) -> None:
-        logger.info("closing transport")
+        logger.debug("closing transport")
         async with self._disconnect_lock:
             self._state = TransportState.CLOSING
             self._shutdown_event.set()

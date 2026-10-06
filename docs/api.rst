@@ -205,8 +205,9 @@ The :class:`~pymt5.MT5WebClient` constructor accepts the following parameters:
      - Timeout in seconds for commands and the initial connection.
    * - ``heartbeat_interval``
      - ``float``
-     - ``30.0``
-     - Interval in seconds between heartbeat pings.
+     - ``5.0``
+     - Interval in seconds between app-level heartbeat pings (MT5 cmd 51),
+       mirroring the official Web Terminal (ping every 5s).
    * - ``tick_history_limit``
      - ``int``
      - ``10000``
@@ -257,16 +258,30 @@ The :class:`~pymt5.MT5WebClient` constructor accepts the following parameters:
      - Maximum number of symbols tracked in tick history. ``0`` disables eviction.
    * - ``ws_ping_interval``
      - ``float | None``
-     - ``20.0``
-     - WebSocket keepalive ping interval. ``None`` disables protocol pings.
+     - ``None``
+     - WebSocket protocol ping interval. ``None`` (default) never initiates
+       pings — reference-client parity, since browsers cannot send pings and
+       some servers never answer them. Server pings are still auto-answered
+       at protocol level. Set an interval for NAT/firewall keepalive traffic.
    * - ``ws_ping_timeout``
      - ``float | None``
-     - ``20.0``
-     - WebSocket keepalive ping timeout.
+     - ``None``
+     - WebSocket pong enforcement timeout. ``None`` (default) never executes
+       a session over a missed pong; liveness is owned 100% by the app
+       heartbeat below. Set a small value to kill pong-less sockets fast —
+       half-open detection then no longer waits for the heartbeat.
    * - ``heartbeat_failure_threshold``
      - ``int``
      - ``3``
      - Consecutive heartbeat ping failures before treating the connection as dead.
+       Second, independent tripwire next to the staleness rule.
+   * - ``heartbeat_stale_after``
+     - ``float``
+     - ``15.0``
+     - Seconds without a successful heartbeat ping after which the session is
+       declared dead (official-UI semantics: close deliberately, then run the
+       normal reconnect path). A ping hanging past one interval counts toward
+       this window instead of stalling detection.
 
 Error Handling Guide
 --------------------

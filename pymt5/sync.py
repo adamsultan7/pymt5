@@ -52,7 +52,7 @@ class SyncMT5Client:
         self,
         uri: str = DEFAULT_WS_URI,
         timeout: float = 30.0,
-        heartbeat_interval: float = 30.0,
+        heartbeat_interval: float = 5.0,
         tick_history_limit: int = 10000,
         max_tick_symbols: int = 0,
         auto_reconnect: bool = False,
@@ -63,9 +63,10 @@ class SyncMT5Client:
         rate_burst: int = 20,
         metrics: MetricsCollector | None = None,
         symbol_cache_ttl: float = 0,
-        ws_ping_interval: float | None = 20.0,
-        ws_ping_timeout: float | None = 20.0,
+        ws_ping_interval: float | None = None,
+        ws_ping_timeout: float | None = None,
         heartbeat_failure_threshold: int = 3,
+        heartbeat_stale_after: float = 15.0,
     ) -> None:
         self._timeout = timeout
         self._client = MT5WebClient(
@@ -85,6 +86,7 @@ class SyncMT5Client:
             ws_ping_interval=ws_ping_interval,
             ws_ping_timeout=ws_ping_timeout,
             heartbeat_failure_threshold=heartbeat_failure_threshold,
+            heartbeat_stale_after=heartbeat_stale_after,
         )
         self._connect_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None

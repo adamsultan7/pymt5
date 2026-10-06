@@ -465,8 +465,10 @@ async def test_reconnect_loop_all_attempts_exhausted():
     client._login_kwargs = {"login": 123, "password": "test"}
     client.transport.close = AsyncMock()
 
-    # Make every reconnect attempt fail
+    # Make every reconnect attempt fail. A transport whose connect() raised
+    # is not ready, so each attempt rebuilds (no adoption).
     failing_transport = MagicMock()
+    failing_transport.is_ready = False
     failing_transport.connect = AsyncMock(side_effect=MT5ConnectionError("refused"))
     failing_transport.close = AsyncMock()
     failing_transport._on_disconnect = None
@@ -504,11 +506,13 @@ async def test_reconnect_loop_succeeds_on_second_attempt():
         t._listeners = {}
         t.on = MagicMock()
         t.close = AsyncMock()
+        # A transport whose connect() raised is not ready, so the next
+        # attempt rebuilds instead of adopting it.
+        t.is_ready = False
         if attempt_count == 1:
             t.connect = AsyncMock(side_effect=MT5ConnectionError("timeout"))
         else:
             t.connect = AsyncMock()
-            t.is_ready = True
             t.send_command = AsyncMock(
                 return_value=CommandResult(command=CMD_LOGIN, code=0, body=login_body),
             )

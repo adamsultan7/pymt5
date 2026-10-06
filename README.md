@@ -112,7 +112,8 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - **Ticket-based trading** — `place_market()` returns position tickets; `close_position_by_ticket()`, `modify_sltp()`; pure helpers `normalize_volume`/`normalize_price`/`resolve_symbol`
 - **Observability** — `connection_stats()` (connects, disconnects, reconnects, heartbeat failures, last error, last-message age)
 - **Async context manager** (`async with MT5WebClient() as client:`)
-- **Auto heartbeat** — periodic ping after login (configurable interval)
+- **Auto heartbeat** — app-level CMD ping every 5s (official-UI cadence); session declared dead after 15s without a successful ping, then the normal reconnect path runs
+- **Passive ws keepalive by default** — never initiates websocket pings (browsers can't either); pong-less servers survive, half-open detection latency ≈ heartbeat interval × threshold
 - **Auto reconnect** — optional reconnect on disconnect with exponential backoff; `max_reconnect_attempts=0`/`None` retries forever, and an exhausted round self-heals on the next call (lazy recovery)
 - **Disconnect callback** — `on_disconnect()` for custom handling
 - **Sync push callbacks run on the background loop thread** — keep them fast, non-blocking, thread-safe; never call blocking client methods from inside one

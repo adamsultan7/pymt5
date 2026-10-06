@@ -269,7 +269,9 @@ def test_client_init_defaults():
     client = MT5WebClient()
     assert client.uri == "wss://web.metatrader.app/terminal"
     assert client.timeout == 30.0
-    assert client._heartbeat_interval == 30.0
+    assert client._heartbeat_interval == 5.0
+    assert client._heartbeat_stale_after == 15.0
+    assert client._heartbeat_failure_threshold == 3
     assert client._logged_in is False
     assert client._symbols == {}
     assert client._symbols_by_id == {}
