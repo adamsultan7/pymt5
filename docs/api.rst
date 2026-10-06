@@ -9,6 +9,21 @@ Client
    :undoc-members:
    :show-inheritance:
 
+Sync Client
+-----------
+
+Blocking facade for trading bots (background loop thread, no asyncio in user
+code). The documented default entry point for bot authors.
+
+.. autoclass:: pymt5.SyncMT5Client
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Reconnect exhaustion: ``max_reconnect_attempts=0``/``None`` retries forever
+with capped backoff. After a finite round is exhausted, the next public call
+triggers a fresh reconnect round (lazy recovery) instead of failing forever.
+
 Transport
 ---------
 
@@ -41,6 +56,10 @@ delivered by the existing push handler callbacks.
    :undoc-members:
 
 .. autoclass:: pymt5.HealthStatus
+   :members:
+   :undoc-members:
+
+.. autoclass:: pymt5.ConnectionStats
    :members:
    :undoc-members:
 

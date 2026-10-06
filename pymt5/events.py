@@ -75,3 +75,20 @@ class HealthStatus:
     last_message_at: float | None
     uptime_seconds: float
     reconnect_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionStats:
+    """Cumulative connection counters for bot observability.
+
+    See :meth:`pymt5.MT5WebClient.connection_stats`. ``heartbeat_failures``
+    is the lifetime total (the consecutive-streak counter stays internal);
+    ``last_error`` is the most recent disconnect reason, if any.
+    """
+
+    connects: int
+    disconnects: int
+    reconnects: int
+    heartbeat_failures: int
+    last_error: str | None
+    last_message_age: float | None

@@ -98,9 +98,12 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - **`on_book_update(callback)`** — order book / DOM pushes (cmd=23)
 
 ### Reliability
+- **Sync client** (`pymt5.sync.SyncMT5Client`, recommended for bots) — blocking facade over a background loop thread
+- **Ticket-based trading** — `place_market()` returns position tickets; `close_position_by_ticket()`, `modify_sltp()`; pure helpers `normalize_volume`/`normalize_price`/`resolve_symbol`
+- **Observability** — `connection_stats()` (connects, disconnects, reconnects, heartbeat failures, last error, last-message age)
 - **Async context manager** (`async with MT5WebClient() as client:`)
 - **Auto heartbeat** — periodic ping after login (configurable interval)
-- **Auto reconnect** — optional reconnect on disconnect with exponential backoff
+- **Auto reconnect** — optional reconnect on disconnect with exponential backoff; `max_reconnect_attempts=0`/`None` retries forever, and an exhausted round self-heals on the next call (lazy recovery)
 - **Disconnect callback** — `on_disconnect()` for custom handling
 - **Python logging** — structured logging via `pymt5.client` and `pymt5.transport` loggers
 
@@ -140,6 +143,24 @@ make check
 ```
 
 ## Quick Start
+
+Sync API (recommended for trading bots — no asyncio needed):
+
+```python
+from pymt5.sync import SyncMT5Client
+
+with SyncMT5Client(auto_reconnect=True) as client:
+    client.login(login=12345678, password="your-password")
+    client.ensure_market_data(["EURUSD"])
+    ticket = client.place_market("EURUSD", "buy", 0.01)
+    print(f"Opened position ticket={ticket}")
+    print(client.connection_stats())
+```
+
+See `examples/09_sync_bot.py` for the full recipe (subscribe → place →
+watch fills → survive a disconnect).
+
+Async API:
 
 ```python
 import asyncio
@@ -291,6 +312,7 @@ python examples/01_connect_and_account.py
 | `06_all_push_notifications.py` | All 9 push notification types in one example |
 | `07_all_order_types.py` | All 9 order types + modify + cancel + close + raw trade_request |
 | `08_misc_features.py` | Corporate links, notifications, trader params, verify code, reconnect |
+| `09_sync_bot.py` | Sync end-to-end bot: subscribe → place → watch fills → close → stats |
 
 ## Command Coverage
 

@@ -13,7 +13,7 @@ try:
     from importlib.metadata import version as _pkg_version
     release = _pkg_version("pymt5")
 except Exception:
-    release = "0.7.0"
+    release = "1.1.0"
 
 extensions = [
     "sphinx.ext.autodoc",

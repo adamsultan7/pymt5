@@ -35,7 +35,7 @@ from pymt5._logging import get_logger
 from pymt5._metrics import MetricsCollector
 from pymt5.client import MT5WebClient
 from pymt5.constants import COPY_TICKS_ALL, DEFAULT_WS_URI
-from pymt5.events import HealthStatus
+from pymt5.events import ConnectionStats, HealthStatus
 from pymt5.exceptions import MT5ConnectionError, MT5TimeoutError
 from pymt5.transport import CommandResult
 from pymt5.types import AccountInfo, Record, RecordList, SymbolInfo, TradeResult
@@ -600,5 +600,24 @@ class SyncMT5Client:
     def on_order_update(self, callback: Callable) -> Callable:
         return self._client.on_order_update(callback)
 
+    def on_trade_result(self, callback: Callable) -> Callable:
+        return self._client.on_trade_result(callback)
+
+    def on_tick_event(self, callback: Callable) -> Callable:
+        return self._client.on_tick_event(callback)
+
+    def on_book_event(self, callback: Callable) -> Callable:
+        return self._client.on_book_event(callback)
+
+    def on_trade_result_event(self, callback: Callable) -> Callable:
+        return self._client.on_trade_result_event(callback)
+
+    def on_account_event(self, callback: Callable) -> Callable:
+        return self._client.on_account_event(callback)
+
     def on_disconnect(self, callback: Callable[[], None]) -> None:
         self._client.on_disconnect(callback)
+
+    def connection_stats(self) -> ConnectionStats:
+        """Return cumulative connection counters (local reads, never blocks)."""
+        return self._client.connection_stats()

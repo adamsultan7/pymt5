@@ -57,7 +57,7 @@ from pymt5.constants import (
     PROP_U32,
     PROP_U64,
 )
-from pymt5.events import HealthStatus
+from pymt5.events import ConnectionStats, HealthStatus
 from pymt5.exceptions import SessionError, ValidationError
 from pymt5.helpers import build_client_id, bytes_to_hex
 from pymt5.protocol import SeriesCodec
@@ -175,6 +175,11 @@ class MT5WebClient(
         # Connection health monitoring (Phase 16.3)
         self._reconnect_count: int = 0
         self._connected_at: float = 0.0
+        # Cumulative observability counters (connection_stats)
+        self._connect_count: int = 0
+        self._disconnect_count: int = 0
+        self._heartbeat_failure_total: int = 0
+        self._last_connection_error: str | None = None
         self._health_degraded_callbacks: list[Callable] = []
         self._health_degraded_threshold_ms: float = 5000.0
         self.transport.on(CMD_TICK_PUSH, self._cache_tick_push)
@@ -201,6 +206,7 @@ class MT5WebClient(
         self._bootstrap_pristine = True
         self._connected_at = time.monotonic()
         self._heartbeat_failures = 0
+        self._connect_count += 1
         if self.transport.server_build:
             logger.info("connected to %s (server_build=%d)", self.uri, self.transport.server_build)
         else:
@@ -290,6 +296,7 @@ class MT5WebClient(
                     raise
                 except Exception as exc:
                     self._heartbeat_failures += 1
+                    self._heartbeat_failure_total += 1
                     logger.warning(
                         "heartbeat ping failed (%d/%d): %s",
                         self._heartbeat_failures,
@@ -336,6 +343,8 @@ class MT5WebClient(
         self._logged_in = False
         self._bootstrap_pristine = False
         self._stop_heartbeat()
+        self._disconnect_count += 1
+        self._last_connection_error = self.transport.last_disconnect_reason
         logger.warning("disconnected from server")
         if self._on_disconnect:
             try:
@@ -473,6 +482,7 @@ class MT5WebClient(
                         except Exception:
                             logger.warning("book resubscribe after reconnect failed", exc_info=True)
                     self._reconnect_count += 1
+                    self._connect_count += 1
                     self._connected_at = time.monotonic()
                     self._heartbeat_failures = 0
                     logger.info("reconnected successfully on attempt %d", attempt)
@@ -544,6 +554,17 @@ class MT5WebClient(
         """
         self._health_degraded_threshold_ms = threshold_ms
         self._health_degraded_callbacks.append(callback)
+
+    def connection_stats(self) -> ConnectionStats:
+        """Return cumulative connection counters (local reads, never blocks)."""
+        return ConnectionStats(
+            connects=self._connect_count,
+            disconnects=self._disconnect_count,
+            reconnects=self._reconnect_count,
+            heartbeat_failures=self._heartbeat_failure_total,
+            last_error=self._last_connection_error,
+            last_message_age=self.transport.last_message_age,
+        )
 
     async def send_raw_command(self, command: int, payload: bytes | None = None) -> CommandResult:
         """Send a raw MT5 command.

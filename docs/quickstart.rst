@@ -1,6 +1,26 @@
 Quick Start
 ===========
 
+Sync API (recommended for trading bots)
+---------------------------------------
+
+No asyncio in user code — see ``examples/09_sync_bot.py`` for the full
+recipe (subscribe, place, watch fills, survive a disconnect).
+
+.. code-block:: python
+
+   from pymt5.sync import SyncMT5Client
+
+   with SyncMT5Client(auto_reconnect=True) as client:
+       client.login(login=12345678, password="your-password")
+       client.ensure_market_data(["EURUSD"])
+       ticket = client.place_market("EURUSD", "buy", 0.01)
+       print(ticket, client.connection_stats())
+
+Reconnect exhaustion: ``max_reconnect_attempts=0``/``None`` retries forever
+with capped backoff. After a finite round is exhausted, the next public call
+triggers a fresh reconnect round (lazy recovery) instead of failing forever.
+
 Basic Connection
 ----------------
 

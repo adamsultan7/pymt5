@@ -81,6 +81,7 @@ class MT5WebSocketTransport:
         self._server_build: int = 0
         self._ws_ping_interval = ws_ping_interval
         self._ws_ping_timeout = ws_ping_timeout
+        self.last_disconnect_reason: str | None = None
 
     @property
     def state(self) -> TransportState:
@@ -267,6 +268,7 @@ class MT5WebSocketTransport:
             return
         already_error = self._state == TransportState.ERROR
         self._state = TransportState.ERROR
+        self.last_disconnect_reason = str(exc) or type(exc).__name__
         if isinstance(exc, (OSError, websockets.exceptions.WebSocketException)):
             fail_exc: Exception = MT5ConnectionError(str(exc) or "websocket connection lost")
             fail_exc.__cause__ = exc

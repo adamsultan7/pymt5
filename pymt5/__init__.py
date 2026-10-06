@@ -8,7 +8,7 @@ try:
 
     __version__ = _pkg_version("pymt5")
 except ImportError:
-    __version__ = "1.0.1"
+    __version__ = "1.1.0"
 
 from pymt5._dataframe import to_dataframe
 from pymt5._metrics import MetricsCollector
@@ -124,7 +124,7 @@ from pymt5.constants import (
     TRADE_RETCODE_DONE_PARTIAL,
     TRADE_RETCODE_PLACED,
 )
-from pymt5.events import AccountEvent, BookEvent, HealthStatus, TickEvent, TradeResultEvent
+from pymt5.events import AccountEvent, BookEvent, ConnectionStats, HealthStatus, TickEvent, TradeResultEvent
 from pymt5.exceptions import (
     AuthenticationError,
     MT5ConnectionError,
@@ -271,6 +271,7 @@ __all__ = [
     "TradeResultEvent",
     "AccountEvent",
     "HealthStatus",
+    "ConnectionStats",
     # Metrics
     "MetricsCollector",
     # Order Manager
