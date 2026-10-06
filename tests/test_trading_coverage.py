@@ -2308,3 +2308,33 @@ async def test_history_deals_get_no_filter():
     )
     result = await client.history_deals_get()
     assert len(result) == 2
+
+
+async def test_trade_request_deviation_wire_layout():
+    """Deviation slot is U32 priceDeviation + two zero F64s (bundle layout)."""
+    from pymt5.constants import PROP_F64, PROP_U32
+    from pymt5.protocol import SeriesCodec
+
+    client = _make_client()
+    seen: dict = {}
+
+    async def _capture(cmd, payload=b""):
+        seen["payload"] = payload
+        return CommandResult(
+            command=CMD_TRADE_REQUEST, code=0, body=_build_trade_response_body(retcode=TRADE_RETCODE_DONE)
+        )
+
+    client.transport.send_command = _capture
+    await client.trade_request(
+        trade_action=TRADE_ACTION_DEAL,
+        symbol="EURUSD",
+        volume=100000000,
+        trade_type=ORDER_TYPE_BUY,
+        deviation=20,
+    )
+    # Offset of the deviation slot: 4+4+64+8+4+8+4*5+8*4 = 144.
+    sliver = seen["payload"][144:164]
+    assert sliver[:4] == b"\x14\x00\x00\x00"
+    assert sliver[4:] == bytes(16)
+    assert sliver == struct.pack("<I", 20) + bytes(16)
+    assert SeriesCodec.parse(sliver, [(PROP_U32,), (PROP_F64,), (PROP_F64,)]) == [20, 0.0, 0.0]

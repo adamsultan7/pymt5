@@ -31,7 +31,6 @@ from pymt5.constants import (
     ORDER_TIME_SPECIFIED_DAY,
     ORDER_TYPE_BUY_STOP_LIMIT,
     ORDER_TYPE_SELL_STOP_LIMIT,
-    PROP_BYTES,
     PROP_F64,
     PROP_FIXED_STRING,
     PROP_U32,
@@ -434,11 +433,15 @@ class _TradingMixin:
                 (PROP_F64, price_trigger),
                 (PROP_F64, price_sl),
                 (PROP_F64, price_tp),
-                (PROP_U64, deviation),
-                # Build 6090+ reserves 12 bytes here (observed as zeros in
-                # official web UI captures). Without them the server drops
-                # the request and comment/position_id misalign.
-                (PROP_BYTES, bytes(12)),
+                # Canonical wire layout per the official bundle: U32
+                # priceDeviation followed by two never-assigned F64 slots
+                # (always 0.0); without these 20 bytes the comment and
+                # position_id fields misalign. (Previously sent as U64 + 12
+                # zero bytes: byte-identical on little-endian, but only by
+                # accident.)
+                (PROP_U32, deviation),
+                (PROP_F64, 0.0),
+                (PROP_F64, 0.0),
                 (PROP_FIXED_STRING, comment[:32], 64),
                 (PROP_U64, position_id),
                 (PROP_U64, position_by),
