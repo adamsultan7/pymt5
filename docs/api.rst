@@ -198,9 +198,14 @@ The :class:`~pymt5.MT5WebClient` constructor accepts the following parameters:
      - ``False``
      - Enable automatic reconnection on unexpected disconnect.
    * - ``max_reconnect_attempts``
-     - ``int``
+     - ``int | None``
      - ``5``
-     - Maximum number of reconnection attempts before giving up.
+     - Maximum number of reconnection attempts per round before giving up.
+       ``0`` or ``None`` retries forever with the same capped backoff.
+       After a finite round is exhausted the transport stays in ERROR, but
+       the next public call triggers a fresh reconnect round instead of
+       failing forever (lazy recovery; requires ``auto_reconnect`` and
+       stored login credentials).
    * - ``reconnect_delay``
      - ``float``
      - ``3.0``

@@ -101,7 +101,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         tick_history_limit: int = 10000,
         max_tick_symbols: int = 0,
         auto_reconnect: bool = False,
-        max_reconnect_attempts: int = 5,
+        max_reconnect_attempts: int | None = 5,
         reconnect_delay: float = 3.0,
         max_reconnect_delay: float = 60.0,
         rate_limit: float = 0,
@@ -178,6 +178,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         self.transport.on(CMD_BOOK_PUSH, self._cache_book_push)
         # Wire up transport disconnect handler
         self.transport._on_disconnect = self._handle_disconnect
+        self.transport._on_demand_recover = self._recover_transport_on_demand
 
     @property
     def is_connected(self) -> bool:
@@ -311,6 +312,22 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
 
     # ---- Reconnect ----
 
+    def _schedule_reconnect(self) -> asyncio.Task | None:
+        """Start one reconnect round unless one is already running.
+
+        Returns the running task, or None when reconnect is disabled,
+        the client is closing, or no credentials are stored.
+        """
+        if self._auto_reconnect and not self._closing and self._login_kwargs:
+            task = self._reconnect_task
+            if task is not None and not task.done():
+                logger.debug("reconnect already in progress, skipping")
+                return task
+            task = asyncio.create_task(self._reconnect_loop())
+            self._reconnect_task = task
+            return task
+        return None
+
     def _handle_disconnect(self) -> None:
         """Called by transport when the WebSocket disconnects unexpectedly."""
         self._logged_in = False
@@ -322,11 +339,30 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                 self._on_disconnect()
             except Exception:
                 logger.warning("on_disconnect handler raised", exc_info=True)
-        if self._auto_reconnect and not self._closing and self._login_kwargs:
-            if self._reconnect_task is not None and not self._reconnect_task.done():
-                logger.debug("reconnect already in progress, skipping")
-                return
-            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        self._schedule_reconnect()
+
+    async def _recover_transport_on_demand(self) -> MT5WebSocketTransport | None:
+        """Run one reconnect round when a call finds the transport in ERROR.
+
+        This is the lazy self-heal for an exhausted reconnect loop: the next
+        public call after a long outage triggers a fresh reconnect round and,
+        on success, is re-dispatched on the live transport instead of raising
+        forever. Returns the live transport, or None when recovery is not
+        possible (disabled, closing, no credentials) or the round failed.
+        """
+        task = self._schedule_reconnect()
+        if task is None:
+            return None
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("on-demand reconnect round failed", exc_info=True)
+        live = self.transport
+        if live.is_ready and self._logged_in:
+            return live
+        return None
 
     def _migrate_transport_listeners(self, old: MT5WebSocketTransport, new: MT5WebSocketTransport) -> None:
         """Carry push subscriptions across a transport replacement.
@@ -359,9 +395,20 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
 
         Uses exponential backoff with jitter:
         ``min(base_delay * 2^(attempt-1) + random(0, base_delay), max_delay)``
+
+        ``max_reconnect_attempts`` of 0 or None means retry forever with the
+        same capped backoff. When a finite round is exhausted the transport
+        stays in ERROR, but the next public call triggers a fresh round via
+        :meth:`_recover_transport_on_demand` instead of failing forever.
         """
+        max_attempts = self._max_reconnect_attempts
+        infinite = max_attempts is None or max_attempts <= 0
+        attempt = 0
         try:
-            for attempt in range(1, self._max_reconnect_attempts + 1):
+            while True:
+                attempt += 1
+                if max_attempts is not None and max_attempts > 0 and attempt > max_attempts:
+                    break
                 if self._closing:
                     logger.debug("reconnect aborted: client is closing")
                     return
@@ -369,7 +416,10 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                     self._reconnect_delay * (2 ** (attempt - 1)) + random.uniform(0, self._reconnect_delay),
                     self._max_reconnect_delay,
                 )
-                logger.info("reconnect attempt %d/%d (delay=%.1fs)", attempt, self._max_reconnect_attempts, delay)
+                if infinite:
+                    logger.info("reconnect attempt %d (retrying until connected; delay=%.1fs)", attempt, delay)
+                else:
+                    logger.info("reconnect attempt %d/%d (delay=%.1fs)", attempt, self._max_reconnect_attempts, delay)
                 if self._metrics:
                     try:
                         self._metrics.on_reconnect_attempt(attempt)
@@ -399,6 +449,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                     self._migrate_transport_listeners(old_transport, new_transport)
                     self.transport = new_transport
                     self.transport._on_disconnect = self._handle_disconnect
+                    self.transport._on_demand_recover = self._recover_transport_on_demand
                     await self.transport.connect()
                     # Re-login with stored credentials
                     if self._login_kwargs is None:
@@ -432,7 +483,11 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                     raise
                 except Exception as exc:
                     logger.warning("reconnect attempt %d failed: %s", attempt, exc)
-            logger.error("all %d reconnect attempts exhausted", self._max_reconnect_attempts)
+            if not infinite:
+                logger.error(
+                    "all %d reconnect attempts exhausted; a later call will trigger a fresh round",
+                    self._max_reconnect_attempts,
+                )
         finally:
             if self._reconnect_task is asyncio.current_task():
                 self._reconnect_task = None

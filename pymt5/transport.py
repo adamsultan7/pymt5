@@ -70,6 +70,7 @@ class MT5WebSocketTransport:
         self._pending: dict[int, deque[asyncio.Future[CommandResult]]] = defaultdict(deque)
         self._listeners: dict[int, set[Callable[[CommandResult], Awaitable[None] | None]]] = defaultdict(set)
         self._on_disconnect: Callable[[], None] | None = None
+        self._on_demand_recover: Callable[[], Awaitable[Any]] | None = None
         self._shutdown_event = asyncio.Event()
         self._disconnect_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
@@ -329,10 +330,32 @@ class MT5WebSocketTransport:
             except ValueError:
                 pass
 
-    async def _send_raw(self, command: int, payload: bytes, check_ready: bool) -> CommandResult:
+    async def _send_raw(
+        self, command: int, payload: bytes, check_ready: bool, _allow_lazy_recovery: bool = True
+    ) -> CommandResult:
         if command not in VALID_COMMANDS:
             raise ProtocolError(f"unsupported command: {command}")
-        self._ensure_usable(command, check_ready)
+        try:
+            self._ensure_usable(command, check_ready)
+        except SessionError:
+            if (
+                not check_ready
+                or not _allow_lazy_recovery
+                or self._state != TransportState.ERROR
+                or self._on_demand_recover is None
+                or self._shutdown_event.is_set()
+            ):
+                raise
+            live = await self._on_demand_recover()
+            if live is None or not isinstance(live, MT5WebSocketTransport):
+                raise
+            if live is self:
+                self._ensure_usable(command, check_ready)
+            else:
+                # Reconnect replaces the transport object: re-dispatch on the
+                # live one without allowing a second recovery round (fail
+                # closed instead of recursing on a flapping connection).
+                return await live._send_raw(command, payload, check_ready, _allow_lazy_recovery=False)
         # self.ws is guaranteed non-None by _ensure_usable
         assert self.ws is not None
         await self._rate_limiter.acquire()

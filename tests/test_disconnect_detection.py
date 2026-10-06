@@ -6,13 +6,15 @@ must trigger disconnect handling, and reconnect must preserve listeners.
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 import websockets.exceptions
 
 from pymt5.client import MT5WebClient
-from pymt5.constants import CMD_BOOK_PUSH, CMD_GET_ACCOUNT, CMD_TICK_PUSH
-from pymt5.transport import MT5WebSocketTransport, TransportState
+from pymt5.constants import CMD_BOOK_PUSH, CMD_GET_ACCOUNT, CMD_PING, CMD_TICK_PUSH
+from pymt5.exceptions import MT5ConnectionError, SessionError
+from pymt5.transport import CommandResult, MT5WebSocketTransport, TransportState
 
 
 class _EmptyWS:
@@ -169,3 +171,140 @@ def test_client_passes_ws_ping_to_transport():
     c = MT5WebClient(ws_ping_interval=5.0, ws_ping_timeout=6.0)
     assert c.transport._ws_ping_interval == 5.0
     assert c.transport._ws_ping_timeout == 6.0
+
+
+def _error_transport(client: MT5WebClient) -> MT5WebSocketTransport:
+    """Simulate an exhausted reconnect round: ERROR, no task, creds stored."""
+    t = MT5WebSocketTransport(uri="wss://x", timeout=5.0)
+    t._state = TransportState.ERROR
+    t._on_disconnect = client._handle_disconnect
+    t._on_demand_recover = client._recover_transport_on_demand
+    client.transport = t
+    client._login_kwargs = {"login": 1, "password": "x"}
+    client._logged_in = False
+    return t
+
+
+def _mock_transport(**overrides):
+    # spec= keeps isinstance(live, MT5WebSocketTransport) true, matching the
+    # real objects _reconnect_loop builds in production.
+    m = MagicMock(spec=MT5WebSocketTransport)
+    m.connect = AsyncMock()
+    m.close = AsyncMock()
+    m.is_ready = True
+    m._on_disconnect = None
+    m._on_demand_recover = None
+    m._listeners = {}
+    m._callback_error_handlers = []
+    m.on = MagicMock()
+    for key, value in overrides.items():
+        setattr(m, key, value)
+    return m
+
+
+async def test_reconnect_zero_means_retry_forever():
+    client = MT5WebClient(
+        auto_reconnect=True,
+        max_reconnect_attempts=0,
+        reconnect_delay=0.001,
+        max_reconnect_delay=0.002,
+    )
+    client._login_kwargs = {"login": 1, "password": "x"}
+    attempts = 0
+
+    def _factory(*args, **kwargs):
+        m = _mock_transport()
+
+        async def _fail():
+            nonlocal attempts
+            attempts += 1
+            if attempts >= 3:
+                raise asyncio.CancelledError()
+            raise MT5ConnectionError("down")
+
+        m.connect = _fail
+        return m
+
+    with patch("pymt5.client.MT5WebSocketTransport", side_effect=_factory), pytest.raises(asyncio.CancelledError):
+        await client._reconnect_loop()
+    # A finite round of max_reconnect_attempts=1 would stop at 1.
+    assert attempts >= 3
+
+
+async def test_reconnect_none_means_retry_forever():
+    client = MT5WebClient(
+        auto_reconnect=True,
+        max_reconnect_attempts=None,
+        reconnect_delay=0.001,
+        max_reconnect_delay=0.002,
+    )
+    client._login_kwargs = {"login": 1, "password": "x"}
+    attempts = 0
+
+    def _factory(*args, **kwargs):
+        m = _mock_transport()
+
+        async def _fail():
+            nonlocal attempts
+            attempts += 1
+            if attempts >= 3:
+                raise asyncio.CancelledError()
+            raise MT5ConnectionError("down")
+
+        m.connect = _fail
+        return m
+
+    with patch("pymt5.client.MT5WebSocketTransport", side_effect=_factory), pytest.raises(asyncio.CancelledError):
+        await client._reconnect_loop()
+    assert attempts >= 3
+
+
+async def test_reconnect_exhaustion_self_heals_on_next_use():
+    """After an exhausted round, the next call reconnects instead of raising."""
+    client = MT5WebClient(
+        auto_reconnect=True,
+        max_reconnect_attempts=1,
+        reconnect_delay=0.001,
+        max_reconnect_delay=0.002,
+        timeout=5.0,
+    )
+    old = _error_transport(client)
+
+    async def _fake_login(**kwargs):
+        client._logged_in = True
+        return ("tok", 1)
+
+    new_mock = _mock_transport(
+        _send_raw=AsyncMock(return_value=CommandResult(command=CMD_PING, code=0, body=b"")),
+    )
+    client.login = _fake_login  # type: ignore[method-assign]
+
+    with patch("pymt5.client.MT5WebSocketTransport", return_value=new_mock):
+        await client.ping()  # must reconnect and succeed, not raise
+
+    assert client.transport is new_mock
+    assert client.transport is not old
+    assert client._logged_in is True
+    assert client.is_connected is True
+
+
+async def test_no_lazy_recovery_when_auto_reconnect_off():
+    client = MT5WebClient(auto_reconnect=False)
+    _error_transport(client)
+    with pytest.raises(SessionError):
+        await client.ping()
+    assert client._reconnect_task is None
+
+
+async def test_lazy_recovery_raises_when_round_exhausted_again():
+    """A failed recovery round fails closed: SessionError, no hang, no resend."""
+    client = MT5WebClient(
+        auto_reconnect=True,
+        max_reconnect_attempts=1,
+        reconnect_delay=0.001,
+        max_reconnect_delay=0.002,
+    )
+    _error_transport(client)
+    failing = _mock_transport(connect=AsyncMock(side_effect=MT5ConnectionError("still down")))
+    with patch("pymt5.client.MT5WebSocketTransport", return_value=failing), pytest.raises(SessionError):
+        await client.ping()
