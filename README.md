@@ -1,7 +1,7 @@
 # pymt5
 
 [![CI](https://github.com/cloudQuant/pymt5/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudQuant/pymt5/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Documentation](https://readthedocs.org/projects/pymt5/badge/?version=latest)](https://pymt5.readthedocs.io/en/latest/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/cloudQuant/pymt5)
@@ -10,9 +10,9 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 
 ## Requirements
 
-- **Python 3.11+** (3.11, 3.12, 3.13)
+- **Python 3.11+** (3.11, 3.12, 3.13, 3.14)
 - **Platforms**: Linux, macOS, Windows
-- **Dependencies**: `websockets`, `cryptography`
+- **Dependencies**: `websockets>=15`, `cryptography>=42`
 
 ## Features
 
@@ -62,6 +62,11 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 ### Trading
 - **Raw**: `trade_request` — full control over all trade fields, returns `TradeResult`
 - **`TradeResult`** includes: `deal`, `order`, `volume`, `price`, `bid`, `ask`, `comment`, `request_id`
+- **Ticket-based** (returns tickets, raises `TradeError`/`MT5TimeoutError` instead of silent failures):
+  - `place_market(symbol, side, volume_lots, ...)` — market order, returns the position ticket
+  - `close_position_by_ticket(ticket, ...)` — close by ticket (resolves symbol/volume/direction)
+  - `modify_sltp(ticket, sl, tp)` — move SL/TP by ticket
+  - `get_close_reason(ticket)` — `OPEN` / `SL_HIT` / `TP_HIT` / `CLOSED` / `UNKNOWN` plus the closing deal
 - **High-level helpers** (auto-resolve digits from symbol cache):
   - `buy_market` / `sell_market` — market orders with optional SL/TP
   - `buy_limit` / `sell_limit` — limit pending orders
@@ -78,6 +83,9 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - `get_symbol_info(name)` — lookup `SymbolInfo` by name
 - `get_symbol_id(name)` — lookup symbol ID by name
 - `symbol_names` — list all cached symbol names
+- `resolve_symbol(name)` — exact-then-prefix lookup for broker suffixes (`XAUUSD.sml`, `EURUSD+`)
+- `ensure_market_data(symbols)` — resolve names and subscribe missing tick streams in one call
+- Pure helpers (also exported from the package root): `normalize_volume`, `normalize_price`, `resolve_symbol`
 
 ### Miscellaneous Commands
 - **`get_corporate_links` (cmd=44)** — broker links (support, education, social)
@@ -96,6 +104,8 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - **`on_symbol_details(callback)`** — extended quote data with options greeks (cmd=17)
 - **`on_trade_result(callback)`** — async trade execution results (cmd=19)
 - **`on_book_update(callback)`** — order book / DOM pushes (cmd=23)
+- Typed variants delivering dataclasses instead of raw dicts: `on_tick_event` (`TickEvent`), `on_book_event` (`BookEvent`), `on_trade_result_event` (`TradeResultEvent`), `on_account_event` (`AccountEvent`)
+- `wait_for_trade_result(action_id, timeout)` — await the cmd-19 push for one request (used internally by the ticket API)
 
 ### Reliability
 - **Sync client** (`pymt5.sync.SyncMT5Client`, recommended for bots) — blocking facade over a background loop thread
@@ -105,6 +115,7 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - **Auto heartbeat** — periodic ping after login (configurable interval)
 - **Auto reconnect** — optional reconnect on disconnect with exponential backoff; `max_reconnect_attempts=0`/`None` retries forever, and an exhausted round self-heals on the next call (lazy recovery)
 - **Disconnect callback** — `on_disconnect()` for custom handling
+- **Sync push callbacks run on the background loop thread** — keep them fast, non-blocking, thread-safe; never call blocking client methods from inside one
 - **Python logging** — structured logging via `pymt5.client` and `pymt5.transport` loggers
 
 ### Constants & Enums
@@ -117,7 +128,7 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 - Command IDs exported: `CMD_GET_ACCOUNT`, `CMD_GET_SYMBOL_GROUPS`, `CMD_TRADE_UPDATE_PUSH`, `CMD_ACCOUNT_UPDATE_PUSH`, `CMD_SYMBOL_DETAILS_PUSH`, `CMD_TRADE_RESULT_PUSH`, `CMD_SUBSCRIBE_BOOK`, `CMD_BOOK_PUSH`, `CMD_GET_CORPORATE_LINKS`
 
 ### Tests
-- 206 offline unit tests: protocol, schemas, roundtrip parsing, trade constants, symbol cache, volume conversion, reconnect logic, compatibility helpers, onboarding/OTP flows, local formula logic, full symbol schema, push handler registration, and extended rate/tick parsing
+- ~1100 offline unit tests: protocol, schemas, roundtrip parsing, trade constants, symbol cache, volume conversion, reconnect logic (including exhaustion self-heal), sync client, ticket-based trading, bot helpers, observability, compatibility helpers, onboarding/OTP flows, local formula logic, full symbol schema, push handler registration, and extended rate/tick parsing
 
 Live-verified against MetaQuotes-Demo on 2026-03-16. The current official Web Terminal reports build 5687, built on 2026-03-15. Verified features include: 6,104 symbols, 6 symbol groups, account info, positions, 60 M1 bars, deals, orders, tick push, all 9 order types, order book subscription, corporate links, notifications, verify code, trader params, and the current onboarding / OTP flows.
 
@@ -242,6 +253,20 @@ result = await client.modify_position_sltp("EURUSD", position_id=123456,
 
 # Cancel pending order
 result = await client.cancel_pending_order(order=789012)
+```
+
+Ticket-based API (returns tickets, raises on rejection/timeout):
+
+```python
+# Market order → position ticket (no action-id bookkeeping)
+ticket = await client.place_market("EURUSD", "buy", 0.01, sl=1.0800, tp=1.1200)
+
+# Close / modify by ticket
+closing_deal = await client.close_position_by_ticket(ticket)
+result = await client.modify_sltp(ticket, sl=1.0850, tp=1.0950)
+
+# Why did it close?
+reason, deal = await client.get_close_reason(ticket)  # OPEN/SL_HIT/TP_HIT/CLOSED/UNKNOWN
 ```
 
 ## Push Notifications
@@ -386,7 +411,7 @@ make check
 
 ## Notes
 
-- This package is experimental and tracks the MT5 Web Terminal protocol as observed in the public Web Terminal build 5687 (built on 2026-03-15)
+- This package tracks the MT5 Web Terminal protocol as observed in the public Web Terminal build 5687 (built on 2026-03-15)
 - MetaQuotes may change the protocol at any time
 - Volume encoding: MT5 uses integer volumes where `volume = lots × 10^precision`. The MetaQuotes demo server uses precision=8, so 1.0 lot = 100,000,000 and 0.01 lot = 1,000,000
 - `get_account()` (cmd=3) returns balance, credit, currency, leverage, and name. Equity, margin, and profit are computed from positions
