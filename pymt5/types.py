@@ -36,6 +36,7 @@ class TradeResult:
     ask: float = 0.0
     comment: str = ""
     request_id: int = 0
+    elapsed_ms: float = 0.0
 
     def __repr__(self) -> str:
         parts = [f"retcode={self.retcode}", f"success={self.success}", f"desc='{self.description}'"]

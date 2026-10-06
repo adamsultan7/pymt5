@@ -1257,12 +1257,12 @@ class TestHandlerReturnValues:
 # ---------------------------------------------------------------------------
 
 
-def _build_trade_result_body(action_id=1005, trade_order=777):
+def _build_trade_result_body(action_id=1005, trade_order=777, action_result_code=10009):
     """Serialize a cmd-19 push body with the given aid/order."""
     from pymt5.schemas import TRADE_RESULT_PUSH_FIELD_NAMES
 
     values = {
-        "action_result_code": 0,
+        "action_result_code": action_result_code,
         "action_id": action_id,
         "trade_action": 3,
         "trade_symbol": "EURUSD",
@@ -1328,6 +1328,31 @@ async def test_wait_for_trade_result_ignores_other_aids_then_resolves():
     record = await asyncio.wait_for(task, timeout=5)
     assert record is not None
     assert record["trade_order"] == 778
+
+
+async def test_wait_for_trade_result_skips_non_final_pushes():
+    """Pushes with non-final action_result_code do not resolve the wait."""
+    import asyncio
+
+    client = MockClient()
+    task = asyncio.create_task(client.wait_for_trade_result(1005, timeout=5))
+    await asyncio.sleep(0)
+    handler = _wait_handler(client)
+    for code in (0, 10001, 10002, 10003, 10028):
+        handler(
+            CommandResult(
+                command=CMD_TRADE_RESULT_PUSH,
+                code=0,
+                body=_build_trade_result_body(1005, 777, action_result_code=code),
+            )
+        )
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=_build_trade_result_body(1005, 779)))
+    record = await asyncio.wait_for(task, timeout=5)
+    assert record is not None
+    assert record["trade_order"] == 779
+    assert record["action_result_code"] == 10009
 
 
 async def test_wait_for_trade_result_timeout_returns_none():

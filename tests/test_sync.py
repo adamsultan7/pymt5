@@ -204,3 +204,15 @@ def test_sync_helper_mirrors():
         assert sync.get_close_reason(777) == ("SL_HIT", {"deal": 99})
     finally:
         sync.close()
+
+
+def test_sync_reports_elapsed_ms():
+    from pymt5.types import TradeResult as _TradeResult
+
+    sync, inst = _make_sync()
+    try:
+        stamped = _TradeResult(retcode=10009, description="done", success=True, elapsed_ms=251.0)
+        inst.modify_sltp = AsyncMock(return_value=stamped)
+        assert sync.modify_sltp(777, 1.08, 1.09).elapsed_ms == 251.0
+    finally:
+        sync.close()

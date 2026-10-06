@@ -49,6 +49,7 @@ from pymt5.constants import (
     TRADE_ACTION_SLTP,
     TRADE_RETCODE_DESCRIPTIONS,
     TRADE_RETCODE_POSITION_CLOSED,
+    TRADE_RETCODE_REQUOTE,
 )
 from pymt5.exceptions import MT5TimeoutError, SymbolNotFoundError, TradeError, ValidationError
 
@@ -105,6 +106,17 @@ class _HighLevelMixin:
         if mode & 2 and not (mode & 1):
             return ORDER_FILLING_IOC
         return ORDER_FILLING_FOK
+
+    @staticmethod
+    def _requote_lf_of(info: Record) -> float:
+        """Per-symbol requote delay: the server ``trade.lf`` field, else 7s."""
+        trade = info.get("trade")
+        lf = trade.get("lf") if isinstance(trade, dict) else None
+        try:
+            value = float(lf if lf is not None else 7.0)
+        except (TypeError, ValueError):
+            return 7.0
+        return value if value > 0 else 7.0
 
     def _normalize_lots(self, info: Record, volume_lots: float) -> float:
         """Round *volume_lots* to the symbol step and clamp to min/max."""
@@ -188,39 +200,77 @@ class _HighLevelMixin:
         deviation: int = 0,
         comment: str = "",
         position_id: int = 0,
-        fill_timeout: float = 10.0,
+        fill_timeout: float = 30.0,
+        requote_retries: int = 0,
+        requote_delay: float | None = None,
+        requote_lf: float = 7.0,
     ) -> int:
-        action_id = random.randint(1, 2**31 - 1)
-        waiter = asyncio.create_task(self.wait_for_trade_result(action_id, timeout=fill_timeout))
-        try:
-            result = await self.trade_request(
-                action_id=action_id,
-                trade_action=trade_action,
-                symbol=symbol,
-                volume=volume_proto,
-                digits=digits,
-                trade_type=trade_type,
-                type_filling=filling,
-                price_order=price_order,
-                price_sl=price_sl,
-                price_tp=price_tp,
-                deviation=deviation,
-                comment=comment,
-                position_id=position_id,
-            )
-        except BaseException:
-            waiter.cancel()
-            raise
-        if not result.success:
+        if requote_retries < 0:
+            raise ValidationError(f"requote_retries must be >= 0, got {requote_retries}")
+        if requote_delay is not None and requote_delay < 0:
+            raise ValidationError(f"requote_delay must be >= 0, got {requote_delay}")
+        # Monotonic send timestamp: every attempt (and the inter-retry wait)
+        # consumes from this single fill_timeout budget. Like the reference
+        # client, there is no per-order timer beyond the transport watchdog —
+        # expiry here fails closed with no resend.
+        t0 = time.monotonic()
+        deadline = t0 + fill_timeout
+        price = price_order
+        retries_left = int(requote_retries)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MT5TimeoutError(
+                    f"fill budget ({fill_timeout}s) exhausted for {symbol} action={trade_action}; "
+                    "the request may have executed — reconcile with positions_get() "
+                    "(no resend was attempted)"
+                )
+            action_id = random.randint(1, 2**31 - 1)
+            waiter = asyncio.create_task(self.wait_for_trade_result(action_id, timeout=remaining))
+            try:
+                result = await self.trade_request(
+                    action_id=action_id,
+                    trade_action=trade_action,
+                    symbol=symbol,
+                    volume=volume_proto,
+                    digits=digits,
+                    trade_type=trade_type,
+                    type_filling=filling,
+                    price_order=price,
+                    price_sl=price_sl,
+                    price_tp=price_tp,
+                    deviation=deviation,
+                    comment=comment,
+                    position_id=position_id,
+                )
+            except BaseException:
+                waiter.cancel()
+                raise
+            if result.success:
+                return await self._resolve_fill(waiter=waiter, result=result, symbol=symbol, trade_action=trade_action)
             waiter.cancel()
             desc = result.description or TRADE_RETCODE_DESCRIPTIONS.get(result.retcode, "")
+            if result.retcode == TRADE_RETCODE_REQUOTE and trade_action == TRADE_ACTION_DEAL and retries_left > 0:
+                retries_left -= 1
+                delay = requote_delay if requote_delay is not None else requote_lf
+                refreshed = result.ask if trade_type == ORDER_TYPE_BUY else result.bid
+                if refreshed > 0:
+                    price = refreshed
+                logger.info(
+                    "requote (10004) on %s; retrying in %.1fs at refreshed price %s (%d retries left)",
+                    symbol,
+                    delay,
+                    price,
+                    retries_left,
+                )
+                await asyncio.sleep(delay)
+                continue
             raise TradeError(
                 f"trade rejected: {symbol} action={trade_action} retcode={result.retcode} ({desc})",
                 retcode=result.retcode,
                 symbol=symbol,
                 action=trade_action,
             )
-        return await self._resolve_fill(waiter=waiter, result=result, symbol=symbol, trade_action=trade_action)
 
     async def place_market(
         self,
@@ -233,12 +283,21 @@ class _HighLevelMixin:
         deviation: int = 20,
         comment: str = "",
         filling: int | None = None,
-        fill_timeout: float = 10.0,
+        fill_timeout: float = 30.0,
+        requote_retries: int = 0,
+        requote_delay: float | None = None,
     ) -> int:
         """Place a market order; return the position (deal) ticket.
 
         Raises :class:`TradeError` on rejection and :class:`MT5TimeoutError`
         when the fill cannot be confirmed (fail closed, never resent).
+
+        On requote (retcode 10004) with ``requote_retries > 0``, the order is
+        resent automatically after ``requote_delay`` seconds (default: the
+        symbol's ``trade.lf`` field, else 7.0s) at the refreshed requote
+        price. Retries share the overall ``fill_timeout`` budget, so keep it
+        above ``requote_delay * (retries + 1)``. Default 0 preserves
+        raise-immediately behavior.
         """
         try:
             order_type = _SIDE_TO_ORDER_TYPE[str(side).strip().lower()]
@@ -258,6 +317,9 @@ class _HighLevelMixin:
             deviation=deviation,
             comment=comment,
             fill_timeout=fill_timeout,
+            requote_retries=requote_retries,
+            requote_delay=requote_delay,
+            requote_lf=self._requote_lf_of(info),
         )
 
     async def _position_or_raise(self, ticket: int) -> Record:
@@ -282,7 +344,7 @@ class _HighLevelMixin:
         deviation: int = 20,
         comment: str = "",
         volume_lots: float | None = None,
-        fill_timeout: float = 10.0,
+        fill_timeout: float = 30.0,
     ) -> int:
         """Close an open position by ticket; return the closing deal ticket."""
         position = await self._position_or_raise(ticket)

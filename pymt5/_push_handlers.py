@@ -58,6 +58,11 @@ logger = get_logger("pymt5.client")
 # Specific exceptions for push handler parsing failures
 _PARSE_ERRORS = (struct.error, KeyError, ValueError, TypeError, IndexError)
 
+# Push action_result_code values that are NOT terminal: the order is still
+# in flight, so waiters keep waiting (mirrors the reference client, which
+# resolves an order purely when the push retcode reaches a final state).
+_NON_FINAL_RESULT_CODES = frozenset({0, 10001, 10002, 10003, 10028})
+
 
 class _PushHandlersMixin:
     """Mixin providing push event handler registration for MT5WebClient."""
@@ -252,9 +257,11 @@ class _PushHandlersMixin:
         """Wait for the cmd-19 result push echoing ``action_id``.
 
         Same push the web UI renders: ``trade_order`` carries the executed
-        ticket (0 means the server answered without executing). Returns the
-        push record dict, or None on timeout. Other handlers still receive
-        the push.
+        ticket (0 means the server answered without executing). Pushes whose
+        ``action_result_code`` is not final yet (0/10001/10002/10003/10028)
+        are skipped — resolution happens purely on the final push. Returns
+        the push record dict, or None on timeout. Other handlers still
+        receive the push.
         """
         import asyncio
 
@@ -288,6 +295,12 @@ class _PushHandlersMixin:
                 except (TypeError, ValueError):
                     return
                 if aid != want:
+                    return
+                try:
+                    final = int(data.get("action_result_code", -1))
+                except (TypeError, ValueError):
+                    final = -1
+                if final in _NON_FINAL_RESULT_CODES:
                     return
                 outcome.append(data)
                 loop.call_soon_threadsafe(event.set)

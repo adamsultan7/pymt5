@@ -63,6 +63,41 @@ Position Management
    # Cancel pending order
    result = await client.cancel_pending_order(order=789012)
 
+Ticket-Based Trading
+~~~~~~~~~~~~~~~~~~~~
+
+``place_market()`` returns the position ticket directly instead of a result
+object, and ``close_position_by_ticket()`` / ``modify_sltp()`` work from the
+ticket alone (no symbol/volume/direction bookkeeping by the caller):
+
+.. code-block:: python
+
+   ticket = await client.place_market("EURUSD", "buy", 0.01, sl=1.0800, tp=1.1200)
+   closing_deal = await client.close_position_by_ticket(ticket)
+   result = await client.modify_sltp(ticket, sl=1.0850, tp=1.0950)
+   reason, deal = await client.get_close_reason(ticket)
+
+Fill confirmation waits on the server push (cmd-19) correlated by action id,
+falling back to the cmd-12 response tickets — mirroring the official Web
+Terminal, which likewise waits on the push with no fixed timer (the 5s/15s
+transport watchdog bounds the wait instead). The ``fill_timeout`` default is
+30.0s so slow fills inside the UI's own ~7s requote window are not
+misreported; pass an explicitly short ``fill_timeout`` to fail faster. Every
+expiry path fails closed with no resend — reconcile with ``positions_get()``.
+
+.. note::
+   Migration: the ``fill_timeout`` default changed from 10.0 to 30.0. Callers
+   that relied on a fast ``MT5TimeoutError`` should pass an explicit short
+   timeout.
+
+On requote (retcode 10004) for market orders, ``place_market()`` can retry
+automatically with ``requote_retries`` (default 0 = raise immediately).
+Each retry waits ``requote_delay`` seconds (default: the symbol's
+``trade.lf`` field, else 7.0s), refreshes the order price from the requote
+payload quotes, and resends — all inside the same overall ``fill_timeout``
+budget, so set the budget above ``requote_delay * (retries + 1)``. Pending
+orders and position closes never auto-retry.
+
 Low-Level Trade Request
 -----------------------
 
@@ -99,3 +134,4 @@ All trade methods return a :class:`~pymt5.TradeResult` dataclass:
 - ``bid`` / ``ask`` — market prices at execution
 - ``comment`` — server comment
 - ``request_id`` — request identifier
+- ``elapsed_ms`` — milliseconds from send to terminal outcome

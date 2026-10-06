@@ -7,6 +7,7 @@ retrieval, and order validation.
 from __future__ import annotations
 
 import struct
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, TypeVar
 
@@ -394,6 +395,7 @@ class _TradingMixin:
         position_by: int = 0,
         time_expiration: int = 0,
     ) -> TradeResult:
+        t0 = time.monotonic()
         if trade_action in (TRADE_ACTION_DEAL, TRADE_ACTION_MARKET_DEAL, TRADE_ACTION_PENDING) and volume <= 0:
             raise ValidationError(f"volume must be > 0 for trade_action={trade_action}, got {volume}")
         if trade_action in (TRADE_ACTION_DEAL, TRADE_ACTION_MARKET_DEAL) and price_order <= 0.0:
@@ -444,7 +446,9 @@ class _TradingMixin:
             ]
         )
         result = await self.transport.send_command(CMD_TRADE_REQUEST, payload)
-        return self._parse_trade_response(result.body, symbol, trade_action, volume)
+        parsed = self._parse_trade_response(result.body, symbol, trade_action, volume)
+        parsed.elapsed_ms = (time.monotonic() - t0) * 1000.0
+        return parsed
 
     async def order_send(self, request: Record) -> TradeResult:
         """Official-style order_send() wrapper over cmd=12 trade_request."""

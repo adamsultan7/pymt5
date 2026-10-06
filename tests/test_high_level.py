@@ -5,13 +5,24 @@ trade_request / wait_for_trade_result / symbol_info / get_positions —
 no action-id bookkeeping or snapshot polling may leak to callers.
 """
 
-from unittest.mock import AsyncMock
+import asyncio
+import logging
+import struct
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pymt5.client import MT5WebClient
-from pymt5.constants import ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_TYPE_BUY, ORDER_TYPE_SELL
+from pymt5.constants import (
+    ORDER_FILLING_FOK,
+    ORDER_FILLING_IOC,
+    ORDER_TYPE_BUY,
+    ORDER_TYPE_BUY_LIMIT,
+    ORDER_TYPE_SELL,
+    TRADE_ACTION_PENDING,
+)
 from pymt5.exceptions import MT5ConnectionError, MT5TimeoutError, SymbolNotFoundError, TradeError, ValidationError
+from pymt5.transport import CommandResult
 from pymt5.types import TradeResult
 
 INFO = {"digits": 5, "volume_min": 0.01, "volume_max": 10.0, "volume_step": 0.01, "filling_mode": 1}
@@ -190,3 +201,172 @@ async def test_modify_sltp_rejection_and_unknown_ticket():
     with pytest.raises(TradeError):
         await c2.modify_sltp(999, 1.08, 1.09)
     c2.trade_request.assert_not_awaited()
+
+
+def _requote(bid=1.0850, ask=1.0852) -> TradeResult:
+    return TradeResult(retcode=10004, description="Requote", success=False, bid=bid, ask=ask)
+
+
+async def test_requote_default_raises_without_resend():
+    c = _client(trade_request=AsyncMock(return_value=_requote()))
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 10004
+    assert c.trade_request.await_count == 1
+
+
+async def test_requote_retry_resends_once_at_refreshed_price():
+    c = _client(trade_request=AsyncMock(side_effect=[_requote(), _ok()]))
+    ticket = await c.place_market("EURUSD", "buy", 0.01, requote_retries=1, requote_delay=0.01)
+    assert ticket == 555
+    assert c.trade_request.await_count == 2
+    first, second = c.trade_request.call_args_list
+    assert first.kwargs["price_order"] == 0.0  # market: server price
+    assert second.kwargs["price_order"] == pytest.approx(1.0852)  # refreshed ask
+    assert first.kwargs["action_id"] != second.kwargs["action_id"]
+    waits = c.wait_for_trade_result.call_args_list
+    assert [w.args[0] for w in waits] == [first.kwargs["action_id"], second.kwargs["action_id"]]
+
+
+async def test_requote_exhausted_raises_last_retcode():
+    c = _client(trade_request=AsyncMock(side_effect=[_requote(), _requote()]))
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=1, requote_delay=0.01)
+    assert exc_info.value.retcode == 10004
+    assert c.trade_request.await_count == 2
+
+
+async def test_requote_never_for_pending_or_close():
+    c = _client(trade_request=AsyncMock(return_value=_requote()))
+    with pytest.raises(TradeError):
+        await c._place_with_fill(
+            symbol="EURUSD",
+            trade_action=TRADE_ACTION_PENDING,
+            volume_proto=1000000,
+            digits=5,
+            filling=0,
+            trade_type=ORDER_TYPE_BUY_LIMIT,
+            price_order=1.08,
+            requote_retries=2,
+            requote_delay=0.01,
+            fill_timeout=5.0,
+        )
+    assert c.trade_request.await_count == 1
+    c2 = _client(trade_request=AsyncMock(return_value=_requote()))
+    with pytest.raises(TradeError):
+        await c2.close_position_by_ticket(777)
+    assert c2.trade_request.await_count == 1
+    import inspect
+
+    assert "requote_retries" in inspect.signature(MT5WebClient.place_market).parameters
+    assert "requote_retries" not in inspect.signature(MT5WebClient.close_position_by_ticket).parameters
+
+
+async def test_requote_retry_logs_at_info(caplog):
+    c = _client(trade_request=AsyncMock(side_effect=[_requote(), _ok()]))
+    with caplog.at_level(logging.DEBUG, logger="pymt5.high_level"):
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=1, requote_delay=0.01)
+    infos = [
+        r
+        for r in caplog.records
+        if r.name == "pymt5.high_level" and r.levelno == logging.INFO and "requote" in r.getMessage()
+    ]
+    assert len(infos) == 1
+    assert "1.0852" in infos[0].getMessage()
+
+
+async def test_requote_budget_expiry_fails_closed():
+    c = _client(trade_request=AsyncMock(return_value=_requote()))
+    with pytest.raises(MT5TimeoutError):
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=2, requote_delay=0.3, fill_timeout=0.1)
+    assert c.trade_request.await_count == 1
+
+
+async def test_requote_delay_prefers_symbol_lf():
+    sleeps: list[float] = []
+
+    async def _record(delay):
+        sleeps.append(delay)
+
+    c = _client(trade_request=AsyncMock(side_effect=[_requote(), _ok()]))
+    c.symbol_info = AsyncMock(return_value=dict(INFO, trade={"lf": 2.0}))
+    with patch("asyncio.sleep", side_effect=_record):
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=1)
+    assert sleeps == [2.0]
+    c2 = _client(trade_request=AsyncMock(side_effect=[_requote(), _ok()]))
+    with patch("asyncio.sleep", side_effect=_record):
+        await c2.place_market("EURUSD", "buy", 0.01, requote_retries=1)
+    assert sleeps == [2.0, 7.0]
+
+
+async def test_requote_negative_params_rejected():
+    c = _client()
+    with pytest.raises(ValidationError):
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=-1)
+    with pytest.raises(ValidationError):
+        await c.place_market("EURUSD", "buy", 0.01, requote_retries=1, requote_delay=-1.0)
+    c.trade_request.assert_not_awaited()
+
+
+async def test_trade_request_reports_elapsed_ms():
+    async def _slow_send(cmd, payload=b""):
+        await asyncio.sleep(0.25)
+        return CommandResult(command=cmd, code=0, body=struct.pack("<I", 10009))
+
+    c = MT5WebClient()
+    c.transport.send_command = _slow_send
+    result = await c.trade_request(trade_action=1, symbol="EURUSD", volume=1000000, trade_type=0)
+    assert result.success is True
+    assert 200 <= result.elapsed_ms < 5000
+
+
+async def test_modify_sltp_reports_elapsed_ms():
+    async def _slow_send(cmd, payload=b""):
+        await asyncio.sleep(0.25)
+        return CommandResult(command=cmd, code=0, body=struct.pack("<I", 10009))
+
+    c = MT5WebClient()
+    c.symbol_info = AsyncMock(return_value=dict(INFO))
+    c.get_positions = AsyncMock(return_value=[dict(BUY_POS)])
+    c.transport.send_command = _slow_send
+    result = await c.modify_sltp(777, 1.08, 1.09)
+    assert 200 <= result.elapsed_ms < 5000
+
+
+async def test_pending_placement_reports_elapsed_ms():
+    async def _slow_send(cmd, payload=b""):
+        await asyncio.sleep(0.25)
+        return CommandResult(command=cmd, code=0, body=struct.pack("<I", 10009))
+
+    c = MT5WebClient()
+    c.symbol_info = AsyncMock(return_value=dict(INFO))
+    c.transport.send_command = _slow_send
+    result = await c.buy_limit("EURUSD", 0.01, price=1.07)
+    assert 200 <= result.elapsed_ms < 5000
+
+
+async def test_slow_fill_succeeds_under_default_budget():
+    """A fill landing ~20s out succeeds: the 30s default covers it."""
+
+    async def _slow_push(action_id, timeout=20.0):
+        await asyncio.sleep(20.0)
+        return {"trade_position": 555, "trade_order": 444}
+
+    c = _client(wait_for_trade_result=AsyncMock(side_effect=_slow_push))
+    ticket = await c.place_market("EURUSD", "buy", 0.01)
+    assert ticket == 555
+    budget = c.wait_for_trade_result.call_args.kwargs["timeout"]
+    assert 29.0 < budget <= 30.0
+    assert c.trade_request.await_count == 1
+
+
+async def test_explicit_short_budget_raises_on_time_without_resend():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=None),
+    )
+    with pytest.raises(MT5TimeoutError):
+        await c.place_market("EURUSD", "buy", 0.01, fill_timeout=0.05)
+    budget = c.wait_for_trade_result.call_args.kwargs["timeout"]
+    assert 0 < budget <= 0.05
+    assert c.trade_request.await_count == 1

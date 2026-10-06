@@ -513,7 +513,9 @@ class SyncMT5Client:
         deviation: int = 20,
         comment: str = "",
         filling: int | None = None,
-        fill_timeout: float = 10.0,
+        fill_timeout: float = 30.0,
+        requote_retries: int = 0,
+        requote_delay: float | None = None,
         timeout: float | None = None,
     ) -> int:
         """Place a market order; return the position ticket (see async API)."""
@@ -528,6 +530,8 @@ class SyncMT5Client:
                 comment=comment,
                 filling=filling,
                 fill_timeout=fill_timeout,
+                requote_retries=requote_retries,
+                requote_delay=requote_delay,
             ),
             timeout,
         )
@@ -539,7 +543,7 @@ class SyncMT5Client:
         deviation: int = 20,
         comment: str = "",
         volume_lots: float | None = None,
-        fill_timeout: float = 10.0,
+        fill_timeout: float = 30.0,
         timeout: float | None = None,
     ) -> int:
         """Close an open position by ticket; return the closing deal ticket."""
