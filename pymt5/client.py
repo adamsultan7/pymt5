@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import random
 import time
@@ -219,8 +220,10 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         self._closing = True
         self._stop_heartbeat()
         if self._reconnect_task is not None:
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+            task, self._reconnect_task = self._reconnect_task, None
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if self._logged_in:
             try:
                 await self.logout()
@@ -262,7 +265,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
     # ---- Heartbeat ----
 
     def _start_heartbeat(self) -> None:
-        if self._heartbeat_task is not None:
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
             return
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -315,7 +318,10 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         self._stop_heartbeat()
         logger.warning("disconnected from server")
         if self._on_disconnect:
-            self._on_disconnect()
+            try:
+                self._on_disconnect()
+            except Exception:
+                logger.warning("on_disconnect handler raised", exc_info=True)
         if self._auto_reconnect and not self._closing and self._login_kwargs:
             if self._reconnect_task is not None and not self._reconnect_task.done():
                 logger.debug("reconnect already in progress, skipping")
@@ -354,60 +360,82 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         Uses exponential backoff with jitter:
         ``min(base_delay * 2^(attempt-1) + random(0, base_delay), max_delay)``
         """
-        for attempt in range(1, self._max_reconnect_attempts + 1):
-            delay = min(
-                self._reconnect_delay * (2 ** (attempt - 1)) + random.uniform(0, self._reconnect_delay),
-                self._max_reconnect_delay,
-            )
-            logger.info("reconnect attempt %d/%d (delay=%.1fs)", attempt, self._max_reconnect_attempts, delay)
-            if self._metrics:
-                self._metrics.on_reconnect_attempt(attempt)
-            await asyncio.sleep(delay)
-            try:
-                # Close old transport to release resources
-                old_transport = self.transport
-                try:
-                    await old_transport.close()
-                except Exception:
-                    pass
-                # Reset transport for fresh connection
-                new_transport = MT5WebSocketTransport(
-                    uri=self.uri,
-                    timeout=self.timeout,
-                    rate_limit=self._rate_limit,
-                    rate_burst=self._rate_burst,
-                    metrics=self._metrics,
-                    ws_ping_interval=self._ws_ping_interval,
-                    ws_ping_timeout=self._ws_ping_timeout,
+        try:
+            for attempt in range(1, self._max_reconnect_attempts + 1):
+                if self._closing:
+                    logger.debug("reconnect aborted: client is closing")
+                    return
+                delay = min(
+                    self._reconnect_delay * (2 ** (attempt - 1)) + random.uniform(0, self._reconnect_delay),
+                    self._max_reconnect_delay,
                 )
-                self._migrate_transport_listeners(old_transport, new_transport)
-                self.transport = new_transport
-                self.transport._on_disconnect = self._handle_disconnect
-                await self.transport.connect()
-                # Re-login with stored credentials
-                if self._login_kwargs is None:
-                    raise SessionError("cannot reconnect: no stored credentials")
-                kwargs = dict(self._login_kwargs)
-                kwargs["auto_heartbeat"] = True
-                await self.login(**kwargs)
-                # Re-subscribe to ticks if we had subscriptions
-                if self._subscribed_ids:
-                    await self.subscribe_ticks(self._subscribed_ids)
-                # Re-subscribe to order book if we had subscriptions
-                if self._subscribed_book_ids:
-                    await self.subscribe_book(self._subscribed_book_ids)
-                self._reconnect_count += 1
-                self._connected_at = time.monotonic()
-                self._heartbeat_failures = 0
-                logger.info("reconnected successfully on attempt %d", attempt)
+                logger.info("reconnect attempt %d/%d (delay=%.1fs)", attempt, self._max_reconnect_attempts, delay)
                 if self._metrics:
-                    self._metrics.on_reconnect_success(attempt)
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("reconnect attempt %d failed: %s", attempt, exc)
-        logger.error("all %d reconnect attempts exhausted", self._max_reconnect_attempts)
+                    try:
+                        self._metrics.on_reconnect_attempt(attempt)
+                    except Exception:
+                        logger.debug("metrics on_reconnect_attempt raised", exc_info=True)
+                await asyncio.sleep(delay)
+                if self._closing:
+                    logger.debug("reconnect aborted: client is closing")
+                    return
+                try:
+                    # Close old transport to release resources
+                    old_transport = self.transport
+                    try:
+                        await old_transport.close()
+                    except Exception:
+                        pass
+                    # Reset transport for fresh connection
+                    new_transport = MT5WebSocketTransport(
+                        uri=self.uri,
+                        timeout=self.timeout,
+                        rate_limit=self._rate_limit,
+                        rate_burst=self._rate_burst,
+                        metrics=self._metrics,
+                        ws_ping_interval=self._ws_ping_interval,
+                        ws_ping_timeout=self._ws_ping_timeout,
+                    )
+                    self._migrate_transport_listeners(old_transport, new_transport)
+                    self.transport = new_transport
+                    self.transport._on_disconnect = self._handle_disconnect
+                    await self.transport.connect()
+                    # Re-login with stored credentials
+                    if self._login_kwargs is None:
+                        raise SessionError("cannot reconnect: no stored credentials")
+                    kwargs = dict(self._login_kwargs)
+                    kwargs["auto_heartbeat"] = True
+                    await self.login(**kwargs)
+                    # Re-subscribe to ticks if we had subscriptions
+                    if self._subscribed_ids:
+                        try:
+                            await self.subscribe_ticks(self._subscribed_ids)
+                        except Exception:
+                            logger.warning("tick resubscribe after reconnect failed", exc_info=True)
+                    # Re-subscribe to order book if we had subscriptions
+                    if self._subscribed_book_ids:
+                        try:
+                            await self.subscribe_book(self._subscribed_book_ids)
+                        except Exception:
+                            logger.warning("book resubscribe after reconnect failed", exc_info=True)
+                    self._reconnect_count += 1
+                    self._connected_at = time.monotonic()
+                    self._heartbeat_failures = 0
+                    logger.info("reconnected successfully on attempt %d", attempt)
+                    if self._metrics:
+                        try:
+                            self._metrics.on_reconnect_success(attempt)
+                        except Exception:
+                            logger.debug("metrics on_reconnect_success raised", exc_info=True)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("reconnect attempt %d failed: %s", attempt, exc)
+            logger.error("all %d reconnect attempts exhausted", self._max_reconnect_attempts)
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
 
     # ---- Health monitoring (Phase 16.3) ----
 
@@ -568,9 +596,15 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
 
     async def logout(self) -> None:
         self._stop_heartbeat()
-        await self.transport.send_command(CMD_LOGOUT)
-        self._logged_in = False
-        self._bootstrap_pristine = False
+        try:
+            await self.transport.send_command(CMD_LOGOUT)
+        finally:
+            # Logout ends the session either way: a failed LOGOUT send
+            # means the connection is already dead, so drop local session
+            # state and credentials to avoid stale auto-reconnect.
+            self._logged_in = False
+            self._bootstrap_pristine = False
+            self._clear_credentials()
         logger.info("logged out")
 
     def _clear_last_error(self) -> None:

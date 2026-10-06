@@ -9,8 +9,12 @@ from __future__ import annotations
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
+from pymt5._logging import get_logger
+
 if TYPE_CHECKING:
     pass
+
+logger = get_logger("pymt5.subscription")
 
 
 class SubscriptionHandle:
@@ -51,12 +55,23 @@ class SubscriptionHandle:
 
     async def unsubscribe(self) -> None:
         """Explicitly unsubscribe. Idempotent."""
-        if self._active:
-            self._active = False
+        if not self._active:
+            return
+        try:
             await self._unsubscribe_fn(self._ids)
+        except Exception:
+            logger.debug("subscription unsubscribe failed", exc_info=True)
+            raise
+        self._active = False
 
     async def __aenter__(self) -> SubscriptionHandle:
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        await self.unsubscribe()
+    async def __aexit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        try:
+            await self.unsubscribe()
+        except Exception:
+            # Never mask the body exception; log and preserve original.
+            logger.debug("subscription cleanup failed on exit", exc_info=True)
+            if exc_val is None:
+                raise

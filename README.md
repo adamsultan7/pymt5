@@ -12,7 +12,7 @@ Python client for the MT5 Web Terminal via reverse-engineered WebSocket binary p
 
 - **Python 3.11+** (3.11, 3.12, 3.13)
 - **Platforms**: Linux, macOS, Windows
-- **Dependencies**: `websockets`, `aiohttp`, `cryptography`
+- **Dependencies**: `websockets`, `cryptography`
 
 ## Features
 

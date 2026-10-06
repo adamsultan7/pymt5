@@ -48,7 +48,7 @@ Requirements
 ------------
 
 - Python 3.11+
-- ``websockets >= 12.0``
+- ``websockets >= 15.0``
 - ``cryptography >= 42.0.0``
 
 Installation

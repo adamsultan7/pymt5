@@ -227,6 +227,22 @@ The :class:`~pymt5.MT5WebClient` constructor accepts the following parameters:
      - ``0``
      - Time-to-live in seconds for the symbol cache. ``0`` means no automatic
        refresh.
+   * - ``max_tick_symbols``
+     - ``int``
+     - ``0``
+     - Maximum number of symbols tracked in tick history. ``0`` disables eviction.
+   * - ``ws_ping_interval``
+     - ``float | None``
+     - ``20.0``
+     - WebSocket keepalive ping interval. ``None`` disables protocol pings.
+   * - ``ws_ping_timeout``
+     - ``float | None``
+     - ``20.0``
+     - WebSocket keepalive ping timeout.
+   * - ``heartbeat_failure_threshold``
+     - ``int``
+     - ``3``
+     - Consecutive heartbeat ping failures before treating the connection as dead.
 
 Error Handling Guide
 --------------------

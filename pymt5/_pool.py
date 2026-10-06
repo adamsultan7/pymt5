@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,9 +69,19 @@ class MT5ConnectionPool:
 
     async def _connect_one(self, acct: PoolAccount) -> None:
         """Connect and log in a single account."""
+        if acct.login in self._clients:
+            try:
+                await self._clients[acct.login].close()
+            except Exception:
+                pass
         client = MT5WebClient(uri=acct.server, **self._client_kwargs)
-        await client.connect()
-        await client.login(login=acct.login, password=acct.password)
+        try:
+            await client.connect()
+            await client.login(login=acct.login, password=acct.password)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await client.close()
+            raise
         self._clients[acct.login] = client
         label = acct.label or str(acct.login)
         logger.info("pool: connected account %s", label)
@@ -105,7 +116,10 @@ class MT5ConnectionPool:
         for client in self._clients.values():
             tasks.append(client.subscribe_ticks(symbol_ids))
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("pool: broadcast subscribe_ticks failed: %s", result)
 
     async def broadcast_load_symbols(self) -> None:
         """Load symbols on all connected clients concurrently."""
@@ -113,4 +127,7 @@ class MT5ConnectionPool:
         for client in self._clients.values():
             tasks.append(client.load_symbols())
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("pool: broadcast load_symbols failed: %s", result)

@@ -72,6 +72,7 @@ class MT5WebSocketTransport:
         self._on_disconnect: Callable[[], None] | None = None
         self._shutdown_event = asyncio.Event()
         self._disconnect_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
         self._metrics = metrics
         self._last_message_at: float = 0.0
         self._connected_at: float = 0.0
@@ -149,6 +150,10 @@ class MT5WebSocketTransport:
         return task is not None and not task.done()
 
     async def connect(self) -> None:
+        async with self._connect_lock:
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
         # Guard against double-connect (Phase 2.4)
         if self.ws is not None:
             await self.close()
@@ -169,16 +174,27 @@ class MT5WebSocketTransport:
         # which breaks the MT5 binary protocol; bypass it explicitly.
         if _WS_CONNECT_HAS_PROXY:
             connect_kwargs["proxy"] = None
-        self.ws = await asyncio.wait_for(
-            _ws_async_client.connect(self.uri, **connect_kwargs),
-            timeout=self.timeout,
-        )
+        try:
+            self.ws = await asyncio.wait_for(
+                _ws_async_client.connect(self.uri, **connect_kwargs),
+                timeout=self.timeout,
+            )
+        except Exception:
+            self._state = TransportState.ERROR
+            self.ws = None
+            raise
         self._recv_task = asyncio.create_task(self._recv_loop())
         logger.debug("websocket open, sending bootstrap")
-        bootstrap = await self._send_raw(CMD_BOOTSTRAP, self.token, check_ready=False)
+        try:
+            bootstrap = await self._send_raw(CMD_BOOTSTRAP, self.token, check_ready=False)
+        except Exception:
+            await self._cleanup_failed_connect()
+            raise
         if bootstrap.code != 0:
+            await self._cleanup_failed_connect()
             raise MT5ConnectionError(f"bootstrap failed: code={bootstrap.code}")
         if len(bootstrap.body) < 66:
+            await self._cleanup_failed_connect()
             raise MT5ConnectionError(f"bootstrap response too short: {len(bootstrap.body)}")
         self.token = bootstrap.body[2:66]
         self.cipher = AESCipher(bootstrap.body[66:])
@@ -190,8 +206,25 @@ class MT5WebSocketTransport:
         self._state = TransportState.READY
         self._connected_at = time.monotonic()
         if self._metrics:
-            self._metrics.on_connect()
+            try:
+                self._metrics.on_connect()
+            except Exception:
+                logger.debug("metrics on_connect raised", exc_info=True)
         logger.info("transport ready (key exchanged)")
+
+    async def _cleanup_failed_connect(self) -> None:
+        """Release socket/recv-task after a failed handshake; state -> ERROR."""
+        if self._recv_task is not None:
+            self._recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._recv_task
+            self._recv_task = None
+        if self.ws is not None:
+            with contextlib.suppress(Exception):
+                await self.ws.close()
+            self.ws = None
+        self._fail_all(MT5ConnectionError("connect handshake failed"))
+        self._state = TransportState.ERROR
 
     async def close(self) -> None:
         logger.info("closing transport")
@@ -329,7 +362,10 @@ class MT5WebSocketTransport:
                     future.cancel()
                 raise
             if self._metrics:
-                self._metrics.on_command_sent(command)
+                try:
+                    self._metrics.on_command_sent(command)
+                except Exception:
+                    logger.debug("metrics on_command_sent raised", exc_info=True)
         try:
             return await asyncio.wait_for(future, timeout=self.timeout)
         except TimeoutError:
@@ -384,7 +420,10 @@ class MT5WebSocketTransport:
     async def _dispatch(self, frame: ResponseFrame) -> None:
         result = CommandResult(command=frame.command, code=frame.code, body=frame.body)
         if self._metrics:
-            self._metrics.on_command_received(frame.command, frame.code)
+            try:
+                self._metrics.on_command_received(frame.command, frame.code)
+            except Exception:
+                logger.debug("metrics on_command_received raised", exc_info=True)
         queue = self._pending.get(frame.command)
         if queue:
             while queue:
