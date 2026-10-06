@@ -168,3 +168,22 @@ def test_sync_local_reads_and_handler_registration():
         assert sync.on_tick(lambda ticks: None) is handler
     finally:
         sync.close()
+
+
+def test_sync_ticket_api_mirrors():
+    from pymt5.types import TradeResult as _TradeResult
+
+    sync, inst = _make_sync()
+    try:
+        inst.place_market = AsyncMock(return_value=555)
+        assert sync.place_market("EURUSD", "buy", 0.01) == 555
+        inst.place_market.assert_awaited_once()
+
+        inst.close_position_by_ticket = AsyncMock(return_value=666)
+        assert sync.close_position_by_ticket(555) == 666
+
+        ok = _TradeResult(retcode=0, description="OK", success=True)
+        inst.modify_sltp = AsyncMock(return_value=ok)
+        assert sync.modify_sltp(555, 1.08, 1.09) is ok
+    finally:
+        sync.close()

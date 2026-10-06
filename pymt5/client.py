@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 
 # Import mixins
 from pymt5._account import _AccountMixin
+from pymt5._high_level import _HighLevelMixin
 from pymt5._logging import get_logger
 from pymt5._market_data import _MarketDataMixin
 from pymt5._metrics import MetricsCollector
@@ -92,7 +93,9 @@ OBSERVED_WEBTERMINAL_BUILD_RELEASE_DATES = {
 }
 
 
-class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _TradingMixin, _OrderHelpersMixin):
+class MT5WebClient(
+    _PushHandlersMixin, _AccountMixin, _MarketDataMixin, _TradingMixin, _OrderHelpersMixin, _HighLevelMixin
+):
     def __init__(
         self,
         uri: str = DEFAULT_WS_URI,

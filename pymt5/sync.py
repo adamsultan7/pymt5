@@ -500,6 +500,62 @@ class SyncMT5Client:
     def cancel_pending_order(self, order: int, timeout: float | None = None) -> TradeResult:
         return self._call(self._client.cancel_pending_order(order), timeout)
 
+    def place_market(
+        self,
+        symbol: str,
+        side: str,
+        volume_lots: float,
+        *,
+        sl: float | None = None,
+        tp: float | None = None,
+        deviation: int = 20,
+        comment: str = "",
+        filling: int | None = None,
+        fill_timeout: float = 10.0,
+        timeout: float | None = None,
+    ) -> int:
+        """Place a market order; return the position ticket (see async API)."""
+        return self._call(
+            self._client.place_market(
+                symbol,
+                side,
+                volume_lots,
+                sl=sl,
+                tp=tp,
+                deviation=deviation,
+                comment=comment,
+                filling=filling,
+                fill_timeout=fill_timeout,
+            ),
+            timeout,
+        )
+
+    def close_position_by_ticket(
+        self,
+        ticket: int,
+        *,
+        deviation: int = 20,
+        comment: str = "",
+        volume_lots: float | None = None,
+        fill_timeout: float = 10.0,
+        timeout: float | None = None,
+    ) -> int:
+        """Close an open position by ticket; return the closing deal ticket."""
+        return self._call(
+            self._client.close_position_by_ticket(
+                ticket,
+                deviation=deviation,
+                comment=comment,
+                volume_lots=volume_lots,
+                fill_timeout=fill_timeout,
+            ),
+            timeout,
+        )
+
+    def modify_sltp(self, ticket: int, sl: float, tp: float, timeout: float | None = None) -> TradeResult:
+        """Move SL/TP of an open position by ticket."""
+        return self._call(self._client.modify_sltp(ticket, sl, tp), timeout)
+
     def wait_for_trade_result(self, action_id: int, timeout: float = 20.0) -> Record | None:
         """Block until the cmd-19 push for *action_id* arrives (None on timeout)."""
         call_timeout = timeout + self._timeout if timeout > 0 else self._timeout
