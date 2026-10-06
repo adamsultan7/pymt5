@@ -37,6 +37,7 @@ from pymt5._parsers import (
 from pymt5._parsers import (
     resolve_symbol as _resolve_cached_symbol,
 )
+from pymt5._push_handlers import _NON_FINAL_RESULT_CODES
 from pymt5.constants import (
     DEAL_ENTRY_OUT,
     DEAL_ENTRY_OUT_BY,
@@ -61,6 +62,53 @@ if TYPE_CHECKING:
 logger = get_logger("pymt5.high_level")
 
 _SIDE_TO_ORDER_TYPE = {"buy": ORDER_TYPE_BUY, "sell": ORDER_TYPE_SELL}
+
+
+class _PushRequote(Exception):
+    """Internal: final push reports requote despite cmd-12 success.
+
+    Carries refreshed quote fields from the push (0.0 when absent) for the
+    retry path in :meth:`_place_with_fill`.
+    """
+
+    def __init__(self, bid: float = 0.0, ask: float = 0.0) -> None:
+        super().__init__("requote")
+        self.bid = bid
+        self.ask = ask
+
+
+def _push_float(push: Record, key: str) -> float:
+    try:
+        return float(push.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _push_ticket(push: Record) -> int:
+    """First nonzero ticket from the push, else 0 (answered without executing)."""
+    for key in ("trade_position", "trade_order"):
+        try:
+            ticket = int(push.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if ticket:
+            return ticket
+    return 0
+
+
+def _push_code(push: Record) -> int | None:
+    """Explicit terminal code from the push, else None.
+
+    Reads ``action_result_code`` first, then ``retcode``. Present-but-garbage
+    counts as absent (never invent a verdict).
+    """
+    for key in ("action_result_code", "retcode"):
+        if key in push:
+            try:
+                return int(push[key])
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 class _HighLevelMixin:
@@ -158,9 +206,13 @@ class _HighLevelMixin:
         """Resolve the ticket for a successful trade request.
 
         Prefers the cmd-19 push (what the web UI renders: ``trade_position``,
-        else ``trade_order``), falls back to the cmd-12 response tickets, and
-        raises :class:`MT5TimeoutError` when neither identifies the fill.
-        Never resends.
+        else ``trade_order``). A push that arrives with zero tickets is proof
+        of non-execution: with an explicit final code it raises
+        :class:`TradeError` (or signals a requote retry for 10004), and with
+        no usable code it raises ``TradeError(retcode=0)`` — never
+        :class:`MT5TimeoutError`, which is reserved for a genuinely missing
+        push. Falls back to the cmd-12 response tickets only when no push
+        arrived at all. Never resends.
         """
         try:
             push = await waiter
@@ -168,13 +220,28 @@ class _HighLevelMixin:
             logger.debug("fill wait failed: %s", exc)
             push = None
         if push:
-            for key in ("trade_position", "trade_order"):
-                try:
-                    ticket = int(push.get(key, 0) or 0)
-                except (TypeError, ValueError):
-                    ticket = 0
-                if ticket:
-                    return ticket
+            ticket = _push_ticket(push)
+            if ticket:
+                return ticket
+            code = _push_code(push)
+            if code is None or code not in _NON_FINAL_RESULT_CODES:
+                if code == TRADE_RETCODE_REQUOTE:
+                    raise _PushRequote(bid=_push_float(push, "bid"), ask=_push_float(push, "ask"))
+                if code is None:
+                    raise TradeError(
+                        "server answered without executing "
+                        f"(no ticket, no reason code): {symbol} action={trade_action}",
+                        retcode=0,
+                        symbol=symbol,
+                        action=trade_action,
+                    )
+                desc = push.get("description") or push.get("comment") or TRADE_RETCODE_DESCRIPTIONS.get(code, "")
+                raise TradeError(
+                    f"server rejected order without executing: {symbol} action={trade_action} retcode={code} ({desc})",
+                    retcode=code,
+                    symbol=symbol,
+                    action=trade_action,
+                )
         if result.deal:
             return int(result.deal)
         if result.order:
@@ -247,7 +314,34 @@ class _HighLevelMixin:
                 waiter.cancel()
                 raise
             if result.success:
-                return await self._resolve_fill(waiter=waiter, result=result, symbol=symbol, trade_action=trade_action)
+                try:
+                    return await self._resolve_fill(
+                        waiter=waiter, result=result, symbol=symbol, trade_action=trade_action
+                    )
+                except _PushRequote as rq:
+                    # The final push overrules cmd-12: server answered success
+                    # but reports requote. Same retry policy as cmd-12 10004.
+                    if trade_action != TRADE_ACTION_DEAL or retries_left <= 0:
+                        raise TradeError(
+                            f"trade rejected: {symbol} action={trade_action} retcode={TRADE_RETCODE_REQUOTE} (Requote)",
+                            retcode=TRADE_RETCODE_REQUOTE,
+                            symbol=symbol,
+                            action=trade_action,
+                        ) from None
+                    retries_left -= 1
+                    delay = requote_delay if requote_delay is not None else requote_lf
+                    refreshed = rq.ask if trade_type == ORDER_TYPE_BUY else rq.bid
+                    if refreshed > 0:
+                        price = refreshed
+                    logger.info(
+                        "requote (10004) on %s; retrying in %.1fs at refreshed price %s (%d retries left)",
+                        symbol,
+                        delay,
+                        price,
+                        retries_left,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
             waiter.cancel()
             desc = result.description or TRADE_RETCODE_DESCRIPTIONS.get(result.retcode, "")
             if result.retcode == TRADE_RETCODE_REQUOTE and trade_action == TRADE_ACTION_DEAL and retries_left > 0:

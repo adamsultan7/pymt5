@@ -85,6 +85,14 @@ transport watchdog bounds the wait instead). The ``fill_timeout`` default is
 misreported; pass an explicitly short ``fill_timeout`` to fail faster. Every
 expiry path fails closed with no resend — reconcile with ``positions_get()``.
 
+A push that arrives with zero tickets is proof the server answered without
+executing: it raises ``TradeError`` (with the push's reason code when
+present, else retcode 0), never ``MT5TimeoutError``. ``MT5TimeoutError`` now
+means only "no final push within budget" — genuinely ambiguous, reconcile
+required. Downstream code that catches ``MT5TimeoutError`` to reconcile
+should also catch ``TradeError`` for the immediate-reject case, where a
+reprice/retry is safe without reconciliation.
+
 .. note::
    Migration: the ``fill_timeout`` default changed from 10.0 to 30.0. Callers
    that relied on a fast ``MT5TimeoutError`` should pass an explicit short

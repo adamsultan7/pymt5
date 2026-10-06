@@ -308,6 +308,112 @@ async def test_requote_negative_params_rejected():
     c.trade_request.assert_not_awaited()
 
 
+def _reject_push(code=10013, order=0, position=0, **extra):
+    push = {"trade_order": order, "trade_position": position, "action_result_code": code}
+    push.update(extra)
+    return push
+
+
+async def test_zero_ticket_final_push_raises_trade_error_fast():
+    import time as _time
+
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10013)),
+    )
+    t0 = _time.monotonic()
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01, fill_timeout=60)
+    assert exc_info.value.retcode == 10013
+    assert _time.monotonic() - t0 < 2.0
+    assert c.trade_request.await_count == 1
+
+
+async def test_zero_ticket_push_surfaces_reason_details():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(
+            return_value={"trade_order": 0, "retcode": 10031, "description": "No connection"}
+        ),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 10031
+    assert "No connection" in str(exc_info.value)
+
+
+async def test_zero_ticket_push_without_code_is_reject_not_timeout():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value={"trade_order": 0}),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 0
+    assert "without executing" in str(exc_info.value)
+
+
+async def test_close_inherits_zero_ticket_reject():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10013)),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.close_position_by_ticket(777)
+    assert exc_info.value.retcode == 10013
+    assert c.trade_request.await_count == 1
+
+
+async def test_pending_inherits_zero_ticket_reject():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10013)),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c._place_with_fill(
+            symbol="EURUSD",
+            trade_action=TRADE_ACTION_PENDING,
+            volume_proto=1000000,
+            digits=5,
+            filling=0,
+            trade_type=ORDER_TYPE_BUY_LIMIT,
+            price_order=1.08,
+            requote_retries=2,
+            requote_delay=0.01,
+            fill_timeout=5.0,
+        )
+    assert exc_info.value.retcode == 10013
+    assert c.trade_request.await_count == 1
+
+
+async def test_push_requote_routes_into_retry_policy():
+    c = _client(
+        trade_request=AsyncMock(side_effect=[_ok(deal=0, order=0), _ok()]),
+        wait_for_trade_result=AsyncMock(
+            side_effect=[
+                {"trade_position": 0, "trade_order": 0, "action_result_code": 10004},
+                {"trade_position": 555, "trade_order": 444},
+            ]
+        ),
+    )
+    ticket = await c.place_market("EURUSD", "buy", 0.01, requote_retries=1, requote_delay=0.01)
+    assert ticket == 555
+    assert c.trade_request.await_count == 2
+
+
+async def test_push_requote_without_retries_is_trade_error():
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(
+            return_value={"trade_position": 0, "trade_order": 0, "action_result_code": 10004}
+        ),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 10004
+    assert c.trade_request.await_count == 1
+
+
 async def test_trade_request_reports_elapsed_ms():
     async def _slow_send(cmd, payload=b""):
         await asyncio.sleep(0.25)

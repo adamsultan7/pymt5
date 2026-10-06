@@ -216,3 +216,28 @@ def test_sync_reports_elapsed_ms():
         assert sync.modify_sltp(777, 1.08, 1.09).elapsed_ms == 251.0
     finally:
         sync.close()
+
+
+def test_sync_zero_ticket_push_raises_trade_error():
+    from pymt5.client import MT5WebClient as _AsyncClient
+    from pymt5.exceptions import TradeError as _TradeError
+    from pymt5.types import TradeResult as _TradeResult
+
+    real = _AsyncClient()
+    real.symbol_info = AsyncMock(
+        return_value={"digits": 5, "volume_min": 0.01, "volume_max": 10.0, "volume_step": 0.01}
+    )
+    real.trade_request = AsyncMock(
+        return_value=_TradeResult(retcode=10009, description="done", success=True, deal=0, order=0)
+    )
+    real.wait_for_trade_result = AsyncMock(
+        return_value={"trade_order": 0, "action_result_code": 10031, "description": "No connection"}
+    )
+    with patch("pymt5.sync.MT5WebClient", return_value=real):
+        sync = SyncMT5Client()
+    try:
+        with pytest.raises(_TradeError) as exc_info:
+            sync.place_market("EURUSD", "buy", 0.01, timeout=5)
+        assert exc_info.value.retcode == 10031
+    finally:
+        sync.close()
