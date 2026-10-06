@@ -177,27 +177,55 @@ def _build_symbol_details_body(symbol_id: int = 42) -> bytes:
     return SeriesCodec.serialize(schema_with_values)
 
 
-def _build_trade_result_push_body() -> bytes:
-    """Build a trade result push body (action + response)."""
-    action_fields = []
-    for field in TRADE_RESULT_PUSH_SCHEMA:
-        entry = dict(field)
-        entry["propValue"] = 0
-        if field["propType"] == PROP_F64:
-            entry["propValue"] = 0.0
-        action_fields.append(entry)
-    action_data = SeriesCodec.serialize(action_fields)
+def _serialize_fields(schema, names, values) -> bytes:
+    """Serialize *schema* with *values* looked up by field name."""
+    specs = []
+    for field, name in zip(schema, names):
+        spec = dict(field)
+        value = values.get(name, 0)
+        spec["propValue"] = value
+        specs.append(spec)
+    return SeriesCodec.serialize(specs)
 
-    resp_fields = []
-    for field in TRADE_RESULT_RESPONSE_SCHEMA:
-        entry = dict(field)
-        entry["propValue"] = 0
-        if field["propType"] == PROP_F64:
-            entry["propValue"] = 0.0
-        resp_fields.append(entry)
-    resp_data = SeriesCodec.serialize(resp_fields)
 
-    return action_data + resp_data
+def _build_trade_result_push_body(
+    *,
+    action_id: int = 0,
+    retcode: int = 0,
+    order: int = 0,
+    comment: str = "",
+    trade_symbol: str = "EURUSD",
+    trade_position: int = 0,
+) -> bytes:
+    """Build a cmd-19 push body in the canonical bundle layout:
+
+    ``[U32 serial][Ap request copy][Ep execution response]``.
+    """
+    from pymt5.schemas import (
+        TRADE_RESULT_CODE_SIZE,
+        TRADE_RESULT_PUSH_FIELD_NAMES,
+        TRADE_RESULT_RESPONSE_FIELD_NAMES,
+    )
+
+    code = struct.pack("<I", 12345)
+    request = _serialize_fields(
+        TRADE_RESULT_PUSH_SCHEMA,
+        TRADE_RESULT_PUSH_FIELD_NAMES,
+        {
+            "action_id": action_id,
+            "trade_symbol": trade_symbol,
+            "comment": comment,
+            "trade_position": trade_position,
+            "trade_order": order,
+        },
+    )
+    response = _serialize_fields(
+        TRADE_RESULT_RESPONSE_SCHEMA,
+        TRADE_RESULT_RESPONSE_FIELD_NAMES,
+        {"retcode": retcode, "trade_order": order, "comment": comment},
+    )
+    assert len(code) == TRADE_RESULT_CODE_SIZE
+    return code + request + response
 
 
 # ---------------------------------------------------------------------------
@@ -885,41 +913,36 @@ class TestOnTradeResult:
         assert client.transport.on.call_args[0][0] == CMD_TRADE_RESULT_PUSH
         handler = client.transport.on.call_args[0][1]
 
-        body = _build_trade_result_push_body()
+        body = _build_trade_result_push_body(retcode=10009, order=777, comment="SignalSt1_30")
         result = CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
         data = callback.call_args[0][0]
         assert isinstance(data, dict)
-        assert "action_result_code" in data
+        assert "action_id" in data
         assert "result" in data
         assert "retcode" in data["result"]
 
     def test_action_only_body_no_result(self) -> None:
-        """Body that only has the action part, no response part."""
+        """Body that only has the request-copy part, no response part."""
         client = MockClient()
         callback = MagicMock()
 
         client.on_trade_result(callback)
         handler = client.transport.on.call_args[0][1]
 
-        # Build only the action part
-        action_fields = []
-        for field in TRADE_RESULT_PUSH_SCHEMA:
-            entry = dict(field)
-            entry["propValue"] = 0
-            if field["propType"] == PROP_F64:
-                entry["propValue"] = 0.0
-            action_fields.append(entry)
-        body = SeriesCodec.serialize(action_fields)
+        # Build the serial prefix + request copy only.
+        from pymt5.schemas import TRADE_RESULT_PUSH_FIELD_NAMES
+
+        body = struct.pack("<I", 12345) + _serialize_fields(TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES, {})
 
         result = CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
         data = callback.call_args[0][0]
-        assert "action_result_code" in data
+        assert "action_id" in data
         assert "result" not in data
 
     def test_empty_body_calls_callback_with_empty_dict(self) -> None:
@@ -1257,38 +1280,82 @@ class TestHandlerReturnValues:
 # ---------------------------------------------------------------------------
 
 
-def _build_trade_result_body(action_id=1005, trade_order=777, action_result_code=10009):
-    """Serialize a cmd-19 push body with the given aid/order."""
-    from pymt5.schemas import TRADE_RESULT_PUSH_FIELD_NAMES
+def _build_push_pair(
+    *,
+    action_id: int = 1005,
+    serial: int = 12345,
+    retcode: int = 10009,
+    order: int = 777,
+    position: int = 0,
+    comment: str = "SignalSt1_CLOSE",
+    bid: float = 1.1,
+    ask: float = 1.2,
+) -> bytes:
+    """Canonical three-record cmd-19 body: [U32 serial][Ap][Ep]."""
+    from pymt5.schemas import (
+        TRADE_RESULT_PUSH_FIELD_NAMES,
+        TRADE_RESULT_RESPONSE_FIELD_NAMES,
+    )
 
-    values = {
-        "action_result_code": action_result_code,
-        "action_id": action_id,
-        "trade_action": 3,
-        "trade_symbol": "EURUSD",
-        "trade_volume": 10000000,
-        "digits": 5,
-        "trade_order": trade_order,
-        "trade_type": 1,
-        "type_filling": 2,
-        "type_time": 0,
-        "type_flags": 2,
-        "type_reason": 0,
-        "price_order": 1.1339,
-        "price_trigger": 0.0,
-        "price_sl": 0.0,
-        "price_tp": 0.0,
-        "deviation": 20,
-        "price_top": 0.0,
-        "price_bottom": 0.0,
-        "comment": "SignalSt1_30",
-    }
-    specs = []
-    for field, name in zip(TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES):
-        spec = dict(field)
-        spec["propValue"] = values.get(name, 0)
-        specs.append(spec)
-    return SeriesCodec.serialize(specs)
+    request = _serialize_fields(
+        TRADE_RESULT_PUSH_SCHEMA,
+        TRADE_RESULT_PUSH_FIELD_NAMES,
+        {
+            "action_id": action_id,
+            "trade_symbol": "EURUSD",
+            "trade_order": order,
+            "trade_position": position,
+            "comment": comment,
+        },
+    )
+    response = _serialize_fields(
+        TRADE_RESULT_RESPONSE_SCHEMA,
+        TRADE_RESULT_RESPONSE_FIELD_NAMES,
+        {"retcode": retcode, "trade_order": order, "comment": comment, "bid": bid, "ask": ask},
+    )
+    return struct.pack("<I", serial) + request + response
+
+
+async def test_push_layout_round_trips_real_retcode_and_comment():
+    """Bug 2: retcode comes from the Ep record; comment loses nothing."""
+    from pymt5._push_handlers import parse_trade_result_push
+
+    body = _build_push_pair(comment="SignalSt1_CLOSE", retcode=10036, order=0)
+    data = parse_trade_result_push(body)
+    assert data is not None
+    assert data["action_id"] == 1005
+    assert data["retcode"] == 10036  # NOT the serial
+    assert data["code"] == 12345  # serial preserved separately
+    assert data["comment"] == "SignalSt1_CLOSE"  # no truncation
+    assert data["result"]["retcode"] == 10036
+
+
+async def test_push_layout_reproduces_captured_records():
+    """The two live captures: 2-char truncation and bogus serial are gone."""
+    from pymt5._push_handlers import parse_trade_result_push
+
+    body = _build_push_pair(comment="filltest", serial=12995407, retcode=10013, order=0)
+    data = parse_trade_result_push(body)
+    assert data is not None
+    assert data["comment"] == "filltest"  # was "lltest" before
+    assert data["retcode"] == 10013  # was 12995407 (serial) before
+    assert data["trade_order"] == 0
+
+    body = _build_push_pair(comment="symtest", serial=12998143, retcode=10013, order=0)
+    data = parse_trade_result_push(body)
+    assert data is not None
+    assert data["comment"] == "symtest"  # was "mtest" before
+    assert data["retcode"] == 10013
+
+
+def _build_trade_result_body(action_id=1005, trade_order=777, retcode=10009):
+    """Serialize a canonical cmd-19 push body with the given aid/order/retcode."""
+    return _build_trade_result_push_body(
+        action_id=action_id,
+        order=trade_order,
+        retcode=retcode,
+        comment="SignalSt1_30",
+    )
 
 
 def _wait_handler(client):
@@ -1331,7 +1398,7 @@ async def test_wait_for_trade_result_ignores_other_aids_then_resolves():
 
 
 async def test_wait_for_trade_result_skips_non_final_pushes():
-    """Pushes with non-final action_result_code do not resolve the wait."""
+    """Pushes with non-final response retcodes do not resolve the wait."""
     import asyncio
 
     client = MockClient()
@@ -1343,7 +1410,7 @@ async def test_wait_for_trade_result_skips_non_final_pushes():
             CommandResult(
                 command=CMD_TRADE_RESULT_PUSH,
                 code=0,
-                body=_build_trade_result_body(1005, 777, action_result_code=code),
+                body=_build_trade_result_body(1005, 777, retcode=code),
             )
         )
     await asyncio.sleep(0.05)
@@ -1352,7 +1419,7 @@ async def test_wait_for_trade_result_skips_non_final_pushes():
     record = await asyncio.wait_for(task, timeout=5)
     assert record is not None
     assert record["trade_order"] == 779
-    assert record["action_result_code"] == 10009
+    assert record["retcode"] == 10009
 
 
 async def test_wait_for_trade_result_timeout_returns_none():

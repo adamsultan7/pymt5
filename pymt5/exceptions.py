@@ -50,6 +50,15 @@ class TradeError(PyMT5Error, ValueError):
         self.action = action
 
 
+class PositionAlreadyClosedError(TradeError):
+    """Raised when closing a position that is already closed.
+
+    Subclass of :class:`TradeError`, so existing handlers keep working, but
+    catchable specifically: bots should treat it as the desired end-state
+    (purge local state) rather than retrying the close.
+    """
+
+
 class ProtocolError(PyMT5Error, ValueError):
     """Raised when the binary protocol parsing fails.
 

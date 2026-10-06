@@ -52,7 +52,13 @@ from pymt5.constants import (
     TRADE_RETCODE_POSITION_CLOSED,
     TRADE_RETCODE_REQUOTE,
 )
-from pymt5.exceptions import MT5TimeoutError, SymbolNotFoundError, TradeError, ValidationError
+from pymt5.exceptions import (
+    MT5TimeoutError,
+    PositionAlreadyClosedError,
+    SymbolNotFoundError,
+    TradeError,
+    ValidationError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -99,10 +105,13 @@ def _push_ticket(push: Record) -> int:
 def _push_code(push: Record) -> int | None:
     """Explicit terminal code from the push, else None.
 
-    Reads ``action_result_code`` first, then ``retcode``. Present-but-garbage
+    Prefers ``retcode`` — the only field carrying the server's real verdict
+    (parsed from the Ep response record). The legacy ``action_result_code``
+    key is a monotonic serial on build 6090+, so it is consulted only as a
+    last resort when no response record was present. Present-but-garbage
     counts as absent (never invent a verdict).
     """
-    for key in ("action_result_code", "retcode"):
+    for key in ("retcode", "action_result_code"):
         if key in push:
             try:
                 return int(push[key])
@@ -202,6 +211,7 @@ class _HighLevelMixin:
         result: TradeResult,
         symbol: str,
         trade_action: int,
+        closing: bool = False,
     ) -> int:
         """Resolve the ticket for a successful trade request.
 
@@ -236,6 +246,13 @@ class _HighLevelMixin:
                         action=trade_action,
                     )
                 desc = push.get("description") or push.get("comment") or TRADE_RETCODE_DESCRIPTIONS.get(code, "")
+                if closing and code == TRADE_RETCODE_POSITION_CLOSED:
+                    raise PositionAlreadyClosedError(
+                        f"position already closed: {symbol} action={trade_action} retcode={code} ({desc})",
+                        retcode=code,
+                        symbol=symbol,
+                        action=trade_action,
+                    )
                 raise TradeError(
                     f"server rejected order without executing: {symbol} action={trade_action} retcode={code} ({desc})",
                     retcode=code,
@@ -271,6 +288,7 @@ class _HighLevelMixin:
         requote_retries: int = 0,
         requote_delay: float | None = None,
         requote_lf: float = 7.0,
+        closing: bool = False,
     ) -> int:
         if requote_retries < 0:
             raise ValidationError(f"requote_retries must be >= 0, got {requote_retries}")
@@ -316,7 +334,7 @@ class _HighLevelMixin:
             if result.success:
                 try:
                     return await self._resolve_fill(
-                        waiter=waiter, result=result, symbol=symbol, trade_action=trade_action
+                        waiter=waiter, result=result, symbol=symbol, trade_action=trade_action, closing=closing
                     )
                 except _PushRequote as rq:
                     # The final push overrules cmd-12: server answered success
@@ -359,6 +377,13 @@ class _HighLevelMixin:
                 )
                 await asyncio.sleep(delay)
                 continue
+            if closing and result.retcode == TRADE_RETCODE_POSITION_CLOSED:
+                raise PositionAlreadyClosedError(
+                    f"position already closed: {symbol} retcode={result.retcode} ({desc})",
+                    retcode=result.retcode,
+                    symbol=symbol,
+                    action=trade_action,
+                )
             raise TradeError(
                 f"trade rejected: {symbol} action={trade_action} retcode={result.retcode} ({desc})",
                 retcode=result.retcode,
@@ -416,7 +441,7 @@ class _HighLevelMixin:
             requote_lf=self._requote_lf_of(info),
         )
 
-    async def _position_or_raise(self, ticket: int) -> Record:
+    async def _position_or_raise(self, ticket: int, *, for_close: bool = False) -> Record:
         positions = await self.get_positions()
         for position in positions:
             try:
@@ -424,8 +449,18 @@ class _HighLevelMixin:
                     return position
             except (TypeError, ValueError):
                 continue
+        message = f"position {ticket} not found among open positions (already closed?)"
+        if for_close:
+            # Provably gone before we sent anything: closing an already-closed
+            # position is the desired end-state, not a retryable failure.
+            raise PositionAlreadyClosedError(
+                message,
+                retcode=TRADE_RETCODE_POSITION_CLOSED,
+                symbol="",
+                action=TRADE_ACTION_DEAL,
+            )
         raise TradeError(
-            f"position {ticket} not found among open positions (already closed?)",
+            message,
             retcode=TRADE_RETCODE_POSITION_CLOSED,
             symbol="",
             action=TRADE_ACTION_DEAL,
@@ -441,7 +476,7 @@ class _HighLevelMixin:
         fill_timeout: float = 30.0,
     ) -> int:
         """Close an open position by ticket; return the closing deal ticket."""
-        position = await self._position_or_raise(ticket)
+        position = await self._position_or_raise(ticket, for_close=True)
         symbol = str(position.get("trade_symbol", "") or "")
         if not symbol:
             raise TradeError(
@@ -477,6 +512,7 @@ class _HighLevelMixin:
             comment=comment,
             position_id=int(ticket),
             fill_timeout=fill_timeout,
+            closing=True,
         )
 
     async def modify_sltp(self, ticket: int, sl: float, tp: float) -> TradeResult:

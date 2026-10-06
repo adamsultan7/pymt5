@@ -416,10 +416,20 @@ class _TradingMixin:
             raise ValidationError(f"price_sl must be >= 0, got {price_sl}")
         if price_tp < 0.0:
             raise ValidationError(f"price_tp must be >= 0, got {price_tp}")
+        # Build-6090 quirk: market deals must go on the wire as action=3
+        # (TRADE_ACTION_MARKET_DEAL); action=1 (TRADE_ACTION_DEAL) is dropped
+        # or rejected by 6090+ servers. The official web UI sends 3 for market
+        # opens/closes, and the fork's constants note "MARKET_DEAL replaces
+        # DEAL=1 there". The public API keeps accepting TRADE_ACTION_DEAL —
+        # only the wire value changes. NOTE: the official UI actually picks an
+        # execution mode per symbol (0..4); unconditional 3 mirrors proven
+        # production behavior, but exchange-execution symbols may later need
+        # the per-symbol mode from full symbol info (trade_exemode).
+        wire_action = TRADE_ACTION_MARKET_DEAL if trade_action == TRADE_ACTION_DEAL else trade_action
         payload = SeriesCodec.serialize(
             [
                 (PROP_U32, action_id),
-                (PROP_U32, trade_action),
+                (PROP_U32, wire_action),
                 (PROP_FIXED_STRING, symbol[:32], 64),
                 (PROP_U64, volume),
                 (PROP_U32, digits),

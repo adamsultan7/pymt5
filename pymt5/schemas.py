@@ -641,34 +641,46 @@ SYMBOL_DETAILS_FIELD_NAMES = [
 
 # ---------------------------------------------------------------------------
 # Trade Result Push (cmd 19)
-# Schema $p/Ap in JS — async trade execution result
+# Schema $p in the reference bundle: three records back to back —
+#   [U32 code][Ap request copy (248B)][Ep response (128B)]
+# ``code`` is a monotonically increasing serial, NOT a retcode; the real
+# terminal verdict lives in the Ep response record (offset 252).
+# The request copy re-sends the order with ``price_deviation`` as a U32 and
+# two unassigned F64 slots, which is what shifted every later field 4 bytes
+# in the previous flat schema (comment lost exactly its first 2 UTF-16 chars).
 # ---------------------------------------------------------------------------
+
+# U32 serial prefix preceding the request copy. Not a standalone schema: the
+# serial is read inline by ``parse_trade_result_push``.
+TRADE_RESULT_CODE_SIZE = 4
+
+# Ap — request copy echoed by the server (248 bytes).
 TRADE_RESULT_PUSH_SCHEMA = [
-    {"propType": PROP_U32},  # 0: action_result_code
-    {"propType": PROP_U32},  # 1: action_id
-    {"propType": PROP_U32},  # 2: trade_action
-    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 3: trade_symbol
-    {"propType": PROP_U64},  # 4: trade_volume
-    {"propType": PROP_U32},  # 5: digits
-    {"propType": PROP_U64},  # 6: trade_order
-    {"propType": PROP_U32},  # 7: trade_type
-    {"propType": PROP_U32},  # 8: type_filling
-    {"propType": PROP_U32},  # 9: type_time
-    {"propType": PROP_U32},  # 10: type_flags
-    {"propType": PROP_U32},  # 11: type_reason
-    {"propType": PROP_F64},  # 12: price_order
-    {"propType": PROP_F64},  # 13: price_trigger
-    {"propType": PROP_F64},  # 14: price_sl
-    {"propType": PROP_F64},  # 15: price_tp
-    {"propType": PROP_U64},  # 16: deviation
-    {"propType": PROP_F64},  # 17: price_top
-    {"propType": PROP_F64},  # 18: price_bottom
-    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 19: comment
-    {"propType": PROP_U64},  # 20: trade_position
+    {"propType": PROP_U32},  # 0: action_id
+    {"propType": PROP_U32},  # 1: trade_action
+    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 2: trade_symbol
+    {"propType": PROP_U64},  # 3: trade_volume
+    {"propType": PROP_U32},  # 4: digits
+    {"propType": PROP_U64},  # 5: trade_order
+    {"propType": PROP_U32},  # 6: trade_type
+    {"propType": PROP_U32},  # 7: type_filling
+    {"propType": PROP_U32},  # 8: type_time
+    {"propType": PROP_U32},  # 9: type_flags
+    {"propType": PROP_U32},  # 10: type_reason
+    {"propType": PROP_F64},  # 11: price_order
+    {"propType": PROP_F64},  # 12: price_trigger
+    {"propType": PROP_F64},  # 13: price_sl
+    {"propType": PROP_F64},  # 14: price_tp
+    {"propType": PROP_U32},  # 15: price_deviation
+    {"propType": PROP_F64},  # 16: price_top
+    {"propType": PROP_F64},  # 17: price_bottom
+    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 18: comment
+    {"propType": PROP_U64},  # 19: trade_position
+    {"propType": PROP_U64},  # 20: position_by
+    {"propType": PROP_BYTES, "propLength": 4},  # 21: reserved
 ]
 
 TRADE_RESULT_PUSH_FIELD_NAMES = [
-    "action_result_code",
     "action_id",
     "trade_action",
     "trade_symbol",
@@ -684,31 +696,39 @@ TRADE_RESULT_PUSH_FIELD_NAMES = [
     "price_trigger",
     "price_sl",
     "price_tp",
-    "deviation",
+    "price_deviation",
     "price_top",
     "price_bottom",
     "comment",
     "trade_position",
+    "position_by",
+    "reserved",
 ]
 
-# Trade result response part (appended after the action details)
+# Ep — execution response appended after the request copy (128 bytes).
 TRADE_RESULT_RESPONSE_SCHEMA = [
-    {"propType": PROP_U32},  # 0: retcode
-    {"propType": PROP_U64},  # 1: trade_order
-    {"propType": PROP_U64},  # 2: volume
-    {"propType": PROP_F64},  # 3: price
-    {"propType": PROP_F64},  # 4: bid
-    {"propType": PROP_F64},  # 5: ask
-    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 6: comment
+    {"propType": PROP_U32},  # 0: retcode (the real terminal verdict)
+    {"propType": PROP_I64},  # 1: deal
+    {"propType": PROP_I64},  # 2: trade_order
+    {"propType": PROP_I64},  # 3: volume
+    {"propType": PROP_F64},  # 4: price
+    {"propType": PROP_U32},  # 5: res_time
+    {"propType": PROP_F64},  # 6: bid
+    {"propType": PROP_F64},  # 7: ask
+    {"propType": PROP_F64},  # 8: last
+    {"propType": PROP_FIXED_STRING, "propLength": 64},  # 9: comment
 ]
 
 TRADE_RESULT_RESPONSE_FIELD_NAMES = [
     "retcode",
+    "deal",
     "trade_order",
     "volume",
     "price",
+    "res_time",
     "bid",
     "ask",
+    "last",
     "comment",
 ]
 

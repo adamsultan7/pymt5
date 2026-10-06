@@ -308,8 +308,58 @@ async def test_requote_negative_params_rejected():
     c.trade_request.assert_not_awaited()
 
 
+async def test_close_already_closed_raises_dedicated_subclass():
+    """Item 3: POSITION_CLOSED on close is catchable as already-closed."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10036)),
+    )
+    with pytest.raises(PositionAlreadyClosedError) as exc_info:
+        await c.close_position_by_ticket(777)
+    assert exc_info.value.retcode == 10036
+    assert isinstance(exc_info.value, TradeError)  # back-compat with TradeError
+
+
+async def test_close_gone_before_send_raises_dedicated_subclass():
+    """Provably missing at pre-flight is also already-closed."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    with pytest.raises(PositionAlreadyClosedError):
+        await c.close_position_by_ticket(999)
+    c.trade_request.assert_not_awaited()
+
+
+async def test_other_close_rejects_stay_generic_trade_error():
+    """A non-10036 reject is NOT reported as already-closed."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10013)),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.close_position_by_ticket(777)
+    assert not isinstance(exc_info.value, PositionAlreadyClosedError)
+
+
+async def test_modify_sltp_missing_position_stays_generic():
+    """modify_sltp shares the lookup but not the already-closed semantics."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    with pytest.raises(TradeError) as exc_info:
+        await c.modify_sltp(999, 1.0, 1.1)
+    assert not isinstance(exc_info.value, PositionAlreadyClosedError)
+    c.trade_request.assert_not_awaited()
+
+
 def _reject_push(code=10013, order=0, position=0, **extra):
-    push = {"trade_order": order, "trade_position": position, "action_result_code": code}
+    # Canonical push record: the real verdict is ``retcode`` (from the Ep
+    # response); ``action_result_code`` is a serial on build 6090+.
+    push = {"trade_order": order, "trade_position": position, "retcode": code}
     push.update(extra)
     return push
 
@@ -391,7 +441,7 @@ async def test_push_requote_routes_into_retry_policy():
         trade_request=AsyncMock(side_effect=[_ok(deal=0, order=0), _ok()]),
         wait_for_trade_result=AsyncMock(
             side_effect=[
-                {"trade_position": 0, "trade_order": 0, "action_result_code": 10004},
+                {"trade_position": 0, "trade_order": 0, "retcode": 10004},
                 {"trade_position": 555, "trade_order": 444},
             ]
         ),
@@ -404,14 +454,48 @@ async def test_push_requote_routes_into_retry_policy():
 async def test_push_requote_without_retries_is_trade_error():
     c = _client(
         trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
-        wait_for_trade_result=AsyncMock(
-            return_value={"trade_position": 0, "trade_order": 0, "action_result_code": 10004}
-        ),
+        wait_for_trade_result=AsyncMock(return_value={"trade_position": 0, "trade_order": 0, "retcode": 10004}),
     )
     with pytest.raises(TradeError) as exc_info:
         await c.place_market("EURUSD", "buy", 0.01)
     assert exc_info.value.retcode == 10004
     assert c.trade_request.await_count == 1
+
+
+async def test_zero_ticket_push_carries_real_retcode_not_serial():
+    """Bug 2: the exception retcode is the Ep verdict, not the push serial."""
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(
+            return_value={
+                "trade_position": 0,
+                "trade_order": 0,
+                "retcode": 10036,
+                "action_result_code": 12995407,  # serial from the live capture
+            }
+        ),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 10036
+    assert "12995407" not in str(exc_info.value)
+
+
+async def test_zero_ticket_push_prefers_retcode_over_serial_key():
+    """When both keys exist, ``retcode`` (Ep) wins over the serial."""
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(
+            return_value={
+                "trade_order": 0,
+                "retcode": 10021,
+                "action_result_code": 12961140,
+            }
+        ),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == 10021
 
 
 async def test_trade_request_reports_elapsed_ms():

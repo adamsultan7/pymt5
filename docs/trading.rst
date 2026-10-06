@@ -86,17 +86,45 @@ misreported; pass an explicitly short ``fill_timeout`` to fail faster. Every
 expiry path fails closed with no resend — reconcile with ``positions_get()``.
 
 A push that arrives with zero tickets is proof the server answered without
-executing: it raises ``TradeError`` (with the push's reason code when
-present, else retcode 0), never ``MT5TimeoutError``. ``MT5TimeoutError`` now
+executing: it raises ``TradeError`` (with the push's real response retcode —
+never the push serial), never ``MT5TimeoutError``. ``MT5TimeoutError`` now
 means only "no final push within budget" — genuinely ambiguous, reconcile
 required. Downstream code that catches ``MT5TimeoutError`` to reconcile
 should also catch ``TradeError`` for the immediate-reject case, where a
 reprice/retry is safe without reconciliation.
 
+Closing an already-closed position raises
+:class:`~pymt5.PositionAlreadyClosedError`, a subclass of ``TradeError``.
+Closing is idempotent, so bots should purge local state instead of retrying:
+
+.. code-block:: python
+
+   from pymt5 import MT5TimeoutError, PositionAlreadyClosedError, TradeError
+
+   try:
+       await client.close_position_by_ticket(ticket)
+       purge(ticket)
+   except PositionAlreadyClosedError:
+       purge(ticket)  # already flat: desired end-state, do not retry
+   except TradeError as exc:
+       log.warning("close rejected: retcode=%s", exc.retcode)  # safe to reprice/retry
+   except MT5TimeoutError:
+       reconcile_with_positions_get()  # ambiguous: verify before any resend
+
 .. note::
    Migration: the ``fill_timeout`` default changed from 10.0 to 30.0. Callers
    that relied on a fast ``MT5TimeoutError`` should pass an explicit short
    timeout.
+
+Build 6090 wire note: market deals are sent with ``trade_action=3``
+(``TRADE_ACTION_MARKET_DEAL``) because 6090+ servers drop or reject the
+older ``action=1`` (``TRADE_ACTION_DEAL``) for market opens/closes. The
+Python API keeps accepting ``TRADE_ACTION_DEAL`` unchanged — only the wire
+value is translated, at the single ``trade_request()`` serialization point.
+The official UI actually selects an execution mode per symbol (0..4);
+unconditional 3 mirrors proven production behavior on Pepperstone/MetaQuotes
+demo servers, though exchange-execution symbols may later need the
+per-symbol ``trade_exemode``.
 
 On requote (retcode 10004) for market orders, ``place_market()`` can retry
 automatically with ``requote_retries`` (default 0 = raise immediately).

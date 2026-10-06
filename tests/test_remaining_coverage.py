@@ -77,7 +77,6 @@ from pymt5.schemas import (
     RATE_BAR_SCHEMA_EXT,
     SYMBOL_DETAILS_SCHEMA,
     TICK_SCHEMA,
-    TRADE_RESULT_PUSH_SCHEMA,
 )
 from pymt5.transport import CommandResult
 from pymt5.types import (
@@ -1380,15 +1379,19 @@ def test_on_symbol_details_parse_error():
 
 
 def test_on_trade_result_parse_error():
-    """Cover lines 222-223: trade result push parse error branch."""
+    """Cover the trade result push parse error branch."""
     client = MockPushClient()
     callback = MagicMock()
     client.on_trade_result(callback)
     handler = _get_registered_handler(client)
 
-    action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
-    with patch.object(SeriesCodec, "parse", side_effect=IndexError("bad")):
-        handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=b"\x00" * action_size))
+    # Derive the size from the live module: an earlier test reloads pymt5,
+    # which rebinds the schema objects imported here at module load time.
+    from pymt5 import _push_handlers as live
+
+    body_size = live.TRADE_RESULT_CODE_SIZE + get_series_size(live.TRADE_RESULT_PUSH_SCHEMA)
+    with patch.object(live, "parse_trade_result_push", side_effect=IndexError("bad")):
+        handler(CommandResult(command=CMD_TRADE_RESULT_PUSH, code=0, body=b"\x00" * body_size))
     callback.assert_not_called()
 
 

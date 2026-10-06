@@ -2338,3 +2338,64 @@ async def test_trade_request_deviation_wire_layout():
     assert sliver[4:] == bytes(16)
     assert sliver == struct.pack("<I", 20) + bytes(16)
     assert SeriesCodec.parse(sliver, [(PROP_U32,), (PROP_F64,), (PROP_F64,)]) == [20, 0.0, 0.0]
+
+
+async def test_trade_request_maps_deal_to_market_deal_on_wire():
+    """Build-6090 quirk: DEAL=1 must serialize as MARKET_DEAL=3."""
+    client = _make_client()
+    seen: dict = {}
+
+    async def _capture(cmd, payload=b""):
+        seen["payload"] = payload
+        return CommandResult(
+            command=CMD_TRADE_REQUEST, code=0, body=_build_trade_response_body(retcode=TRADE_RETCODE_DONE)
+        )
+
+    client.transport.send_command = _capture
+    await client.trade_request(
+        trade_action=TRADE_ACTION_DEAL,
+        symbol="EURUSD",
+        volume=100000000,
+        trade_type=ORDER_TYPE_BUY,
+        deviation=20,
+    )
+    # action is the second U32 field (offset 4..8) in the wire layout.
+    wire_action = struct.unpack_from("<I", seen["payload"], 4)[0]
+    assert wire_action == 3  # TRADE_ACTION_MARKET_DEAL
+
+
+async def test_trade_request_keeps_non_deal_actions_unchanged():
+    """PENDING/SLTP/etc. keep their own action ids on the wire."""
+    client = _make_client()
+    seen: list = []
+
+    async def _capture(cmd, payload=b""):
+        seen.append(payload)
+        return CommandResult(
+            command=CMD_TRADE_REQUEST, code=0, body=_build_trade_response_body(retcode=TRADE_RETCODE_PLACED)
+        )
+
+    client.transport.send_command = _capture
+    await client.trade_request(
+        trade_action=TRADE_ACTION_PENDING,
+        symbol="EURUSD",
+        volume=100000000,
+        trade_type=ORDER_TYPE_BUY_LIMIT,
+        price_order=1.08,
+    )
+    assert struct.unpack_from("<I", seen[-1], 4)[0] == TRADE_ACTION_PENDING
+
+    await client.trade_request(
+        trade_action=TRADE_ACTION_SLTP,
+        symbol="EURUSD",
+        position_id=1,
+        price_sl=1.0,
+        price_tp=1.1,
+    )
+    assert struct.unpack_from("<I", seen[-1], 4)[0] == TRADE_ACTION_SLTP
+
+    await client.trade_request(
+        trade_action=TRADE_ACTION_REMOVE,
+        order=1,
+    )
+    assert struct.unpack_from("<I", seen[-1], 4)[0] == TRADE_ACTION_REMOVE

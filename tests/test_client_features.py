@@ -904,18 +904,21 @@ def test_symbol_details_schema():
 
 
 def test_trade_result_push_schema():
-    assert len(TRADE_RESULT_PUSH_SCHEMA) == 21
-    assert len(TRADE_RESULT_PUSH_FIELD_NAMES) == 21
-    assert "action_result_code" in TRADE_RESULT_PUSH_FIELD_NAMES
+    # Bundle ``$p`` request copy: 22 fields (21 + reserved trailing slot).
+    assert len(TRADE_RESULT_PUSH_SCHEMA) == 22
+    assert len(TRADE_RESULT_PUSH_FIELD_NAMES) == 22
+    assert "action_id" in TRADE_RESULT_PUSH_FIELD_NAMES
     assert "trade_symbol" in TRADE_RESULT_PUSH_FIELD_NAMES
     assert "trade_position" in TRADE_RESULT_PUSH_FIELD_NAMES
+    assert "price_deviation" in TRADE_RESULT_PUSH_FIELD_NAMES
 
 
 def test_trade_result_response_schema():
-    assert len(TRADE_RESULT_RESPONSE_SCHEMA) == 7
-    assert len(TRADE_RESULT_RESPONSE_FIELD_NAMES) == 7
+    assert len(TRADE_RESULT_RESPONSE_SCHEMA) == 10
+    assert len(TRADE_RESULT_RESPONSE_FIELD_NAMES) == 10
     assert "retcode" in TRADE_RESULT_RESPONSE_FIELD_NAMES
     assert "price" in TRADE_RESULT_RESPONSE_FIELD_NAMES
+    assert "ask" in TRADE_RESULT_RESPONSE_FIELD_NAMES
 
 
 def test_trade_transaction_schema():

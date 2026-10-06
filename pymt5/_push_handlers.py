@@ -35,6 +35,7 @@ from pymt5.schemas import (
     POSITION_SCHEMA,
     SYMBOL_DETAILS_FIELD_NAMES,
     SYMBOL_DETAILS_SCHEMA,
+    TRADE_RESULT_CODE_SIZE,
     TRADE_RESULT_PUSH_FIELD_NAMES,
     TRADE_RESULT_PUSH_SCHEMA,
     TRADE_RESULT_RESPONSE_FIELD_NAMES,
@@ -58,10 +59,45 @@ logger = get_logger("pymt5.client")
 # Specific exceptions for push handler parsing failures
 _PARSE_ERRORS = (struct.error, KeyError, ValueError, TypeError, IndexError)
 
-# Push action_result_code values that are NOT terminal: the order is still
-# in flight, so waiters keep waiting (mirrors the reference client, which
-# resolves an order purely when the push retcode reaches a final state).
+# Push retcode values that are NOT terminal: the order is still in flight, so
+# waiters keep waiting (mirrors the reference client's ``isFinal()``, which
+# resolves an order only when the response retcode leaves this set).
 _NON_FINAL_RESULT_CODES = frozenset({0, 10001, 10002, 10003, 10028})
+
+# Byte layout of the cmd-19 push (bundle schema ``$p``):
+#   [U32 serial][Ap request copy][Ep response]
+_CODE_SIZE = TRADE_RESULT_CODE_SIZE
+
+
+def parse_trade_result_push(body: bytes) -> Record | None:
+    """Parse a cmd-19 push into the flat record the push API exposes.
+
+    Layout (reference bundle ``$p``): a U32 serial, the ``Ap`` request copy
+    (248B), then the ``Ep`` execution response (128B). The flat record merges
+    the request copy with the response: response fields win on name clashes
+    (notably ``retcode``, which only exists in the response), and the merged
+    ``result`` dict mirrors the response record. Returns None when the fixed
+    request-copy portion is not fully present.
+    """
+    request_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
+    response_size = get_series_size(TRADE_RESULT_RESPONSE_SCHEMA)
+    if len(body) < _CODE_SIZE + request_size:
+        return None
+    data: dict[str, Any] = {"code": struct.unpack_from("<I", body, 0)[0]}
+    req_vals = SeriesCodec.parse_at(body, TRADE_RESULT_PUSH_SCHEMA, _CODE_SIZE)
+    data.update(zip(TRADE_RESULT_PUSH_FIELD_NAMES, req_vals))
+    if len(body) >= _CODE_SIZE + request_size + response_size:
+        resp_vals = SeriesCodec.parse_at(body, TRADE_RESULT_RESPONSE_SCHEMA, _CODE_SIZE + request_size)
+        result = dict(zip(TRADE_RESULT_RESPONSE_FIELD_NAMES, resp_vals))
+        result["comment"] = _strip_nul(result.get("comment"))
+        data["result"] = result
+        # Response fields win: the real terminal verdict lives here.
+        data.update(result)
+    return data
+
+
+def _strip_nul(value: Any) -> Any:
+    return value.rstrip("\x00") if isinstance(value, str) else value
 
 
 class _PushHandlersMixin:
@@ -236,17 +272,7 @@ class _PushHandlersMixin:
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
-                resp_size = get_series_size(TRADE_RESULT_RESPONSE_SCHEMA)
-                data: dict[str, Any] = {}
-                if len(body) >= action_size:
-                    vals = SeriesCodec.parse(body, TRADE_RESULT_PUSH_SCHEMA)
-                    data.update(zip(TRADE_RESULT_PUSH_FIELD_NAMES, vals))
-                if len(body) >= action_size + resp_size:
-                    resp_vals = SeriesCodec.parse_at(body, TRADE_RESULT_RESPONSE_SCHEMA, action_size)
-                    data["result"] = dict(zip(TRADE_RESULT_RESPONSE_FIELD_NAMES, resp_vals))
-                callback(data)
+                callback(parse_trade_result_push(result.body) or {})
             except _PARSE_ERRORS as exc:
                 logger.error("trade result push parse error: %s", exc)
 
@@ -258,7 +284,7 @@ class _PushHandlersMixin:
 
         Same push the web UI renders: ``trade_order`` carries the executed
         ticket (0 means the server answered without executing). Pushes whose
-        ``action_result_code`` is not final yet (0/10001/10002/10003/10028)
+        response ``retcode`` is not final yet (0/10001/10002/10003/10028)
         are skipped — resolution happens purely on the final push. Returns
         the push record dict, or None on timeout. Other handlers still
         receive the push.
@@ -284,12 +310,9 @@ class _PushHandlersMixin:
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
-                if len(body) < action_size:
+                data = parse_trade_result_push(result.body)
+                if data is None:
                     return
-                vals = SeriesCodec.parse(body, TRADE_RESULT_PUSH_SCHEMA)
-                data = dict(zip(TRADE_RESULT_PUSH_FIELD_NAMES, vals))
                 try:
                     aid = int(data.get("action_id", 0) or 0)
                 except (TypeError, ValueError):
@@ -297,7 +320,7 @@ class _PushHandlersMixin:
                 if aid != want:
                     return
                 try:
-                    final = int(data.get("action_result_code", -1))
+                    final = int(data.get("retcode", -1))
                 except (TypeError, ValueError):
                     final = -1
                 if final in _NON_FINAL_RESULT_CODES:
@@ -443,16 +466,7 @@ class _PushHandlersMixin:
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA)
-                resp_size = get_series_size(TRADE_RESULT_RESPONSE_SCHEMA)
-                data: dict[str, Any] = {}
-                if len(body) >= action_size:
-                    vals = SeriesCodec.parse(body, TRADE_RESULT_PUSH_SCHEMA)
-                    data.update(zip(TRADE_RESULT_PUSH_FIELD_NAMES, vals))
-                if len(body) >= action_size + resp_size:
-                    resp_vals = SeriesCodec.parse_at(body, TRADE_RESULT_RESPONSE_SCHEMA, action_size)
-                    data["result"] = dict(zip(TRADE_RESULT_RESPONSE_FIELD_NAMES, resp_vals))
+                data = parse_trade_result_push(result.body) or {}
                 result_data = data.get("result", {})
                 event = TradeResultEvent(
                     retcode=int(result_data.get("retcode", 0)),
