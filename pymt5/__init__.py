@@ -135,10 +135,12 @@ from pymt5.exceptions import (
     TradeError,
     ValidationError,
 )
+from pymt5.sync import SyncMT5Client
 from pymt5.transport import TransportState
 
 __all__ = [
     "MT5WebClient",
+    "SyncMT5Client",
     "TradeResult",
     "SymbolInfo",
     "AccountInfo",
