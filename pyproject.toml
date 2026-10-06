@@ -26,8 +26,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "websockets>=13.0,<16",
-    "cryptography>=42.0.0,<45",
+    "websockets>=15.0,<18",
+    "cryptography>=42.0.0,<51",
 ]
 
 [project.optional-dependencies]

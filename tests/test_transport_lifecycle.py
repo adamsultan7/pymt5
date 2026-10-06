@@ -103,7 +103,7 @@ class TestConnect:
 
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         assert t.is_ready is True
@@ -123,7 +123,7 @@ class TestConnect:
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
         with (
-            patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws),
+            patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws),
             pytest.raises((RuntimeError, ConnectionError), match="bootstrap failed: code=1"),
         ):
             await t.connect()
@@ -139,7 +139,7 @@ class TestConnect:
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
         with (
-            patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws),
+            patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws),
             pytest.raises((RuntimeError, ConnectionError), match="bootstrap response too short"),
         ):
             await t.connect()
@@ -154,7 +154,7 @@ class TestConnect:
 
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         # ws.send should have been called with the bootstrap command
@@ -175,12 +175,12 @@ class TestConnect:
         mock_ws1 = _make_mock_ws(messages=[response_bytes])
         mock_ws2 = _make_mock_ws(messages=[response_bytes])
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws1):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws1):
             await t.connect()
 
         assert t.ws is mock_ws1
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws2):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws2):
             await t.connect()
 
         # First ws should have been closed
@@ -197,7 +197,7 @@ class TestConnect:
 
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         assert t._recv_task is not None
@@ -871,7 +871,7 @@ class TestEdgeCases:
 
         mock_ws = _make_mock_ws(messages=[response_bytes])
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         assert t.cipher.key == b"\xcd" * 16

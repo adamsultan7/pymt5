@@ -111,7 +111,7 @@ class TestTransportMetricsCallbacks:
         mock_ws.__aiter__ = AsyncMock(return_value=iter([]))
         mock_ws.close = AsyncMock()
 
-        with patch("pymt5.transport.websockets.connect", return_value=_async_return(mock_ws)):
+        with patch("pymt5.transport._ws_async_client.connect", return_value=_async_return(mock_ws)):
             # We need the recv_loop to process the bootstrap response.
             # Instead of running the full connect(), we manually orchestrate:
             # 1. Set up the transport state

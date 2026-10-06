@@ -56,7 +56,7 @@ from pymt5.constants import (
     PROP_U64,
 )
 from pymt5.events import HealthStatus
-from pymt5.exceptions import PyMT5Error, SessionError, ValidationError
+from pymt5.exceptions import SessionError, ValidationError
 from pymt5.helpers import build_client_id, bytes_to_hex
 from pymt5.protocol import SeriesCodec
 from pymt5.transport import CommandResult, MT5WebSocketTransport
@@ -107,18 +107,27 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         rate_burst: int = 20,
         metrics: MetricsCollector | None = None,
         symbol_cache_ttl: float = 0,
+        ws_ping_interval: float | None = 20.0,
+        ws_ping_timeout: float | None = 20.0,
+        heartbeat_failure_threshold: int = 3,
     ):
         self.uri = uri
         self.timeout = timeout
         self._rate_limit = rate_limit
         self._rate_burst = rate_burst
         self._metrics = metrics
+        self._ws_ping_interval = ws_ping_interval
+        self._ws_ping_timeout = ws_ping_timeout
+        self._heartbeat_failure_threshold = max(1, int(heartbeat_failure_threshold))
+        self._heartbeat_failures = 0
         self.transport = MT5WebSocketTransport(
             uri=uri,
             timeout=timeout,
             rate_limit=rate_limit,
             rate_burst=rate_burst,
             metrics=metrics,
+            ws_ping_interval=ws_ping_interval,
+            ws_ping_timeout=ws_ping_timeout,
         )
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_task: asyncio.Task | None = None
@@ -186,6 +195,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
         await self.transport.connect()
         self._bootstrap_pristine = True
         self._connected_at = time.monotonic()
+        self._heartbeat_failures = 0
         if self.transport.server_build:
             logger.info("connected to %s (server_build=%d)", self.uri, self.transport.server_build)
         else:
@@ -267,9 +277,32 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                 await asyncio.sleep(self._heartbeat_interval)
                 try:
                     await self.ping()
+                    self._heartbeat_failures = 0
                     logger.debug("heartbeat ping ok")
-                except (OSError, PyMT5Error) as exc:
-                    logger.warning("heartbeat ping failed: %s", exc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._heartbeat_failures += 1
+                    logger.warning(
+                        "heartbeat ping failed (%d/%d): %s",
+                        self._heartbeat_failures,
+                        self._heartbeat_failure_threshold,
+                        exc,
+                    )
+                    if self._heartbeat_failures >= self._heartbeat_failure_threshold:
+                        logger.error(
+                            "heartbeat failed %d times in a row; treating as disconnect",
+                            self._heartbeat_failures,
+                        )
+                        try:
+                            await self.transport._handle_connection_loss(exc)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.debug("transport disconnect handling failed", exc_info=True)
+                        # Exit the loop; _handle_disconnect() already stopped
+                        # the task reference and scheduled a reconnect when enabled.
+                        return
         except asyncio.CancelledError:
             pass
 
@@ -289,6 +322,32 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                 return
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
+    def _migrate_transport_listeners(self, old: MT5WebSocketTransport, new: MT5WebSocketTransport) -> None:
+        """Carry push subscriptions across a transport replacement.
+
+        Reconnect previously created a bare transport, silently dropping
+        user ``on_*`` handlers and the internal tick/book caches.
+        """
+        try:
+            for cmd, callbacks in old._listeners.items():
+                for cb in tuple(callbacks):
+                    # Internal caches are re-registered explicitly below to
+                    # avoid bound-method duplicates (which would double-cache).
+                    func = getattr(cb, "__func__", None)
+                    if func is not None and func.__name__ in {"_cache_tick_push", "_cache_book_push"}:
+                        continue
+                    new._listeners[cmd].add(cb)
+        except Exception:
+            logger.debug("listener migration failed", exc_info=True)
+        try:
+            for handler in tuple(old._callback_error_handlers):
+                if handler not in new._callback_error_handlers:
+                    new._callback_error_handlers.append(handler)
+        except Exception:
+            logger.debug("callback-error-handler migration failed", exc_info=True)
+        new.on(CMD_TICK_PUSH, self._cache_tick_push)
+        new.on(CMD_BOOK_PUSH, self._cache_book_push)
+
     async def _reconnect_loop(self) -> None:
         """Try to reconnect and re-login with stored credentials.
 
@@ -306,18 +365,23 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
             await asyncio.sleep(delay)
             try:
                 # Close old transport to release resources
+                old_transport = self.transport
                 try:
-                    await self.transport.close()
+                    await old_transport.close()
                 except Exception:
                     pass
                 # Reset transport for fresh connection
-                self.transport = MT5WebSocketTransport(
+                new_transport = MT5WebSocketTransport(
                     uri=self.uri,
                     timeout=self.timeout,
                     rate_limit=self._rate_limit,
                     rate_burst=self._rate_burst,
                     metrics=self._metrics,
+                    ws_ping_interval=self._ws_ping_interval,
+                    ws_ping_timeout=self._ws_ping_timeout,
                 )
+                self._migrate_transport_listeners(old_transport, new_transport)
+                self.transport = new_transport
                 self.transport._on_disconnect = self._handle_disconnect
                 await self.transport.connect()
                 # Re-login with stored credentials
@@ -334,11 +398,14 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
                     await self.subscribe_book(self._subscribed_book_ids)
                 self._reconnect_count += 1
                 self._connected_at = time.monotonic()
+                self._heartbeat_failures = 0
                 logger.info("reconnected successfully on attempt %d", attempt)
                 if self._metrics:
                     self._metrics.on_reconnect_success(attempt)
                 return
-            except (OSError, PyMT5Error) as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 logger.warning("reconnect attempt %d failed: %s", attempt, exc)
         logger.error("all %d reconnect attempts exhausted", self._max_reconnect_attempts)
 
@@ -356,7 +423,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
             try:
                 await self.ping()
                 ping_latency_ms = (time.monotonic() - t0) * 1000.0
-            except (OSError, PyMT5Error):
+            except Exception:
                 ping_latency_ms = None
 
         last_msg = self.transport._last_message_at if self.transport._last_message_at > 0 else None
@@ -491,6 +558,7 @@ class MT5WebClient(_PushHandlersMixin, _AccountMixin, _MarketDataMixin, _Trading
             "utm_source": utm_source,
         }
         logger.info("logged in: login=%d session=%d", login, int(session_id))
+        self._heartbeat_failures = 0
         if auto_heartbeat:
             self._start_heartbeat()
         return bytes_to_hex(token_bytes), int(session_id)

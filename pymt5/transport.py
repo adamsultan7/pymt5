@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import websockets
+import websockets.asyncio.client as _ws_async_client
 from websockets.asyncio.client import ClientConnection
 
 from pymt5._logging import get_logger
@@ -23,8 +24,10 @@ from pymt5.protocol import ResponseFrame, build_command, pack_outer, parse_respo
 
 logger = get_logger("pymt5.transport")
 
-# Cache inspect.signature result at module level (Phase 3.5)
-_WS_CONNECT_HAS_PROXY = "proxy" in _inspect.signature(websockets.connect).parameters
+# Use the asyncio WebSocket client (not the legacy websockets.connect).
+# Kept as a module attribute so tests can patch
+# ``pymt5.transport._ws_async_client.connect``.
+_WS_CONNECT_HAS_PROXY = "proxy" in _inspect.signature(_ws_async_client.connect).parameters
 
 
 class TransportState(enum.Enum):
@@ -52,6 +55,8 @@ class MT5WebSocketTransport:
         rate_limit: float = 0,
         rate_burst: int = 20,
         metrics: MetricsCollector | None = None,
+        ws_ping_interval: float | None = 20.0,
+        ws_ping_timeout: float | None = 20.0,
     ):
         self.uri = uri
         self.timeout = timeout
@@ -72,6 +77,8 @@ class MT5WebSocketTransport:
         self._connected_at: float = 0.0
         self._callback_error_handlers: list[Callable] = []
         self._server_build: int = 0
+        self._ws_ping_interval = ws_ping_interval
+        self._ws_ping_timeout = ws_ping_timeout
 
     @property
     def state(self) -> TransportState:
@@ -93,6 +100,54 @@ class MT5WebSocketTransport:
         """Server build number extracted from the bootstrap response prefix."""
         return self._server_build
 
+    @property
+    def last_message_age(self) -> float | None:
+        """Seconds since the last inbound message, or None if none received."""
+        if self._last_message_at <= 0:
+            return None
+        return time.monotonic() - self._last_message_at
+
+    def _is_ws_open(self) -> bool:
+        """Best-effort check that the underlying socket is still open.
+
+        Only returns False on affirmative evidence of closure (real
+        ``State.CLOSED/CLOSING``, ``closed is True``, or an int close
+        code). Mocks and unknown states are treated as open so unit
+        tests with ``AsyncMock`` sockets keep working.
+        """
+        ws = self.ws
+        if ws is None:
+            return False
+        try:
+            state = getattr(ws, "state", None)
+        except Exception:
+            state = None
+        if state is not None:
+            name = getattr(state, "name", None)
+            if isinstance(name, str):
+                if name in ("CLOSED", "CLOSING"):
+                    return False
+                if name in ("OPEN", "CONNECTING"):
+                    return True
+                # Unknown string state: assume open.
+                return True
+            # Non-string .name (e.g. Mock): fall through to other checks.
+        try:
+            closed = getattr(ws, "closed", None)
+        except Exception:
+            closed = None
+        if isinstance(closed, bool):
+            return not closed
+        try:
+            close_code = getattr(ws, "close_code", None)
+        except Exception:
+            close_code = None
+        return not isinstance(close_code, int)
+
+    def _recv_task_alive(self) -> bool:
+        task = self._recv_task
+        return task is not None and not task.done()
+
     async def connect(self) -> None:
         # Guard against double-connect (Phase 2.4)
         if self.ws is not None:
@@ -102,19 +157,20 @@ class MT5WebSocketTransport:
         self.cipher = initial_cipher()
         logger.info("connecting to %s", self.uri)
         connect_kwargs: dict[str, Any] = {
-            "ping_interval": None,
+            "ping_interval": self._ws_ping_interval,
+            "ping_timeout": self._ws_ping_timeout,
             "max_size": None,
             "open_timeout": self.timeout,
             "additional_headers": {
                 "Origin": "https://web.metatrader.app",
             },
         }
-        # websockets >=15 auto-detects system proxy (proxy=True default)
+        # websockets auto-detects system proxy (proxy=True default)
         # which breaks the MT5 binary protocol; bypass it explicitly.
         if _WS_CONNECT_HAS_PROXY:
             connect_kwargs["proxy"] = None
         self.ws = await asyncio.wait_for(
-            websockets.connect(self.uri, **connect_kwargs),
+            _ws_async_client.connect(self.uri, **connect_kwargs),
             timeout=self.timeout,
         )
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -148,7 +204,8 @@ class MT5WebSocketTransport:
                 await self._recv_task
             self._recv_task = None
         if self.ws is not None:
-            await self.ws.close()
+            with contextlib.suppress(Exception):
+                await self.ws.close()
             self.ws = None
         self._fail_all(SessionError("transport closed"))
         self._state = TransportState.DISCONNECTED
@@ -166,40 +223,140 @@ class MT5WebSocketTransport:
     async def send_command(self, command: int, payload: bytes | None = None) -> CommandResult:
         return await self._send_raw(command, payload or b"", check_ready=True)
 
+    async def _handle_connection_loss(self, exc: BaseException) -> None:
+        """Mark the transport as broken, fail pending calls, notify once.
+
+        Safe to call from the recv loop, send path, or health checks.
+        No-op when the transport is shutting down explicitly.
+        """
+        if self._shutdown_event.is_set() or self._state == TransportState.CLOSING:
+            return
+        already_error = self._state == TransportState.ERROR
+        self._state = TransportState.ERROR
+        if isinstance(exc, (OSError, websockets.exceptions.WebSocketException)):
+            fail_exc: Exception = MT5ConnectionError(str(exc) or "websocket connection lost")
+            fail_exc.__cause__ = exc
+        elif isinstance(exc, Exception):
+            fail_exc = exc
+        else:
+            fail_exc = MT5ConnectionError(f"websocket connection lost: {exc!r}")
+        self._fail_all(fail_exc)
+        if self._metrics and not already_error:
+            try:
+                self._metrics.on_disconnect(str(exc))
+            except Exception:
+                pass
+        if already_error:
+            return
+        logger.error("transport disconnected: %s", exc)
+        should_notify = False
+        try:
+            async with self._disconnect_lock:
+                if self._on_disconnect and not self._shutdown_event.is_set():
+                    should_notify = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            should_notify = False
+        if should_notify and self._on_disconnect:
+            try:
+                self._on_disconnect()
+            except Exception:
+                logger.warning("on_disconnect handler raised", exc_info=True)
+
+    def _ensure_usable(self, command: int, check_ready: bool) -> None:
+        if check_ready and self._state != TransportState.READY:
+            raise SessionError(f"transport not ready for command {command} (state={self._state.value})")
+        if self.ws is None:
+            raise MT5ConnectionError("websocket not connected")
+        if check_ready and not self._is_ws_open():
+            # Socket already closed at the websockets level but our state
+            # has not flipped yet (half-open / clean close race).
+            raise MT5ConnectionError("websocket connection is closed")
+        if check_ready and not self._recv_task_alive():
+            recv = self._recv_task
+            if recv is not None and recv.done():
+                recv_exc: BaseException | None = None
+                try:
+                    recv_exc = recv.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                detail = f": {recv_exc}" if recv_exc else ""
+                raise MT5ConnectionError(f"connection receiver is not running{detail}")
+
+    def _drop_pending(self, command: int, future: asyncio.Future[CommandResult]) -> None:
+        if future.done():
+            return
+        queue = self._pending.get(command)
+        if queue:
+            try:
+                queue.remove(future)
+            except ValueError:
+                pass
+
     async def _send_raw(self, command: int, payload: bytes, check_ready: bool) -> CommandResult:
         if command not in VALID_COMMANDS:
             raise ProtocolError(f"unsupported command: {command}")
-        if check_ready and not self.is_ready:
-            raise SessionError(f"transport not ready for command {command}")
-        if self.ws is None:
-            raise MT5ConnectionError("websocket not connected")
+        self._ensure_usable(command, check_ready)
+        # self.ws is guaranteed non-None by _ensure_usable
+        assert self.ws is not None
         await self._rate_limiter.acquire()
+        # Re-check after rate-limit wait: the socket may have died while queued.
+        try:
+            self._ensure_usable(command, check_ready)
+        except (MT5ConnectionError, SessionError) as exc:
+            await self._handle_connection_loss(exc)
+            raise
         async with self._lock:
             future: asyncio.Future[CommandResult] = asyncio.get_running_loop().create_future()
             self._pending[command].append(future)
             inner = build_command(command, payload)
             encrypted = self.cipher.encrypt(inner)
             logger.debug("send cmd=%d payload=%d bytes", command, len(payload))
-            await self.ws.send(pack_outer(encrypted))
+            try:
+                await self.ws.send(pack_outer(encrypted))
+            except (OSError, websockets.exceptions.WebSocketException) as exc:
+                self._drop_pending(command, future)
+                if not future.done():
+                    future.cancel()
+                await self._handle_connection_loss(exc)
+                raise MT5ConnectionError(f"send failed for command {command}: {exc}") from exc
+            except Exception:
+                self._drop_pending(command, future)
+                if not future.done():
+                    future.cancel()
+                raise
             if self._metrics:
                 self._metrics.on_command_sent(command)
         try:
             return await asyncio.wait_for(future, timeout=self.timeout)
         except TimeoutError:
             # Remove leaked future from _pending on timeout (Phase 2.1)
+            self._drop_pending(command, future)
             if not future.done():
-                queue = self._pending.get(command)
-                if queue:
-                    try:
-                        queue.remove(future)
-                    except ValueError:
-                        pass
+                future.cancel()
+            # A lone timeout does not prove a dead socket, but if the
+            # underlying ws is already closed the state must flip now so
+            # the next call errors instead of hanging silently.
+            if not self._is_ws_open() or not self._recv_task_alive():
+                await self._handle_connection_loss(
+                    MT5ConnectionError(f"command {command} timed out and connection looks dead")
+                )
             raise MT5TimeoutError(f"command {command} timed out after {self.timeout}s") from None
+        except (MT5ConnectionError, SessionError):
+            raise
+        except (OSError, websockets.exceptions.WebSocketException) as exc:
+            # Future was failed by _handle_connection_loss with the raw error.
+            raise MT5ConnectionError(f"command {command} failed: {exc}") from exc
 
     async def _recv_loop(self) -> None:
         try:
-            assert self.ws is not None
-            async for message in self.ws:
+            ws = self.ws
+            if ws is None:
+                return
+            async for message in ws:
                 if isinstance(message, str):
                     continue
                 try:
@@ -213,24 +370,16 @@ class MT5WebSocketTransport:
                 except (struct.error, ValueError, TypeError, IndexError, ProtocolError) as exc:
                     logger.error("recv_loop parse error: %s", exc)
                     continue
+            # Normal loop exit == server cleanly closed the socket.
+            # Previously this silently left state==READY forever.
+            if not self._shutdown_event.is_set():
+                await self._handle_connection_loss(MT5ConnectionError("server closed the connection"))
         except asyncio.CancelledError:
             raise
         except (OSError, websockets.exceptions.WebSocketException) as exc:
-            logger.error("recv_loop disconnected: %s", exc)
-            self._fail_all(exc)
-            self._state = TransportState.ERROR
-            if self._metrics:
-                self._metrics.on_disconnect(str(exc))
-            # Serialize against close() to prevent double-disconnect
-            should_notify = False
-            try:
-                async with self._disconnect_lock:
-                    if self._on_disconnect and not self._shutdown_event.is_set():
-                        should_notify = True
-            except asyncio.CancelledError:
-                raise
-            if should_notify and self._on_disconnect:
-                self._on_disconnect()
+            await self._handle_connection_loss(exc)
+        except Exception as exc:
+            await self._handle_connection_loss(exc)
 
     async def _dispatch(self, frame: ResponseFrame) -> None:
         result = CommandResult(command=frame.command, code=frame.code, body=frame.body)

@@ -297,7 +297,7 @@ class _PushHandlersMixin:
         self.transport.on(CMD_TRADE_RESULT_PUSH, _handler)
         try:
             await asyncio.wait_for(event.wait(), timeout=limit if limit > 0 else 0.0)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             return None
         finally:
             try:

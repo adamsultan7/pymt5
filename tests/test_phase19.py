@@ -91,7 +91,7 @@ class TestServerBuildTransport:
         mock_ws = _MockWS(messages=[response])
         t = MT5WebSocketTransport(uri="wss://example.com", timeout=5.0)
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         assert t.server_build == build_number
@@ -106,7 +106,7 @@ class TestServerBuildTransport:
         mock_ws = _MockWS(messages=[response])
         t = MT5WebSocketTransport(uri="wss://example.com", timeout=5.0)
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await t.connect()
 
         assert t.server_build == 0
@@ -142,7 +142,7 @@ class TestServerBuildClient:
         mock_ws = _MockWS(messages=[response])
         client = MT5WebClient(uri="wss://example.com", timeout=5.0)
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await client.connect()
 
         assert client.server_build == build_number
@@ -159,7 +159,7 @@ class TestServerBuildClient:
         mock_ws = _MockWS(messages=[response])
         client = MT5WebClient(uri="wss://example.com", timeout=5.0)
 
-        with patch("pymt5.transport.websockets.connect", new_callable=AsyncMock, return_value=mock_ws):
+        with patch("pymt5.transport._ws_async_client.connect", new_callable=AsyncMock, return_value=mock_ws):
             await client.connect()
 
         assert client.server_build == 0
