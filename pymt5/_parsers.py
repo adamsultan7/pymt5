@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import struct
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from fnmatch import fnmatchcase
 
@@ -20,6 +21,7 @@ from pymt5.constants import (
     PERIOD_MAP,
     TRADE_ACTION_PENDING,
 )
+from pymt5.exceptions import SymbolNotFoundError, ValidationError
 from pymt5.protocol import SeriesCodec, get_series_size
 from pymt5.schemas import (
     ACCOUNT_WEB_COMMISSION_FIELD_NAMES,
@@ -235,6 +237,73 @@ def _validate_requested_volume(symbol_info: Record, volume: float) -> str | None
         if abs(steps - round(steps)) > 1e-9:
             return f"volume {volume} does not align with step {volume_step}"
     return None
+
+
+def normalize_volume(
+    volume_lots: float,
+    *,
+    min_volume: float = 0.0,
+    max_volume: float = 0.0,
+    step: float = 0.0,
+) -> float:
+    """Round lots to *step* and clamp to [*min_volume*, *max_volume*].
+
+    Raises :class:`ValidationError` for non-positive or still-misaligned
+    volumes. Zero bounds/steps disable that check.
+    """
+    try:
+        volume = float(volume_lots)
+    except (TypeError, ValueError):
+        raise ValidationError(f"volume must be a number, got {volume_lots!r}") from None
+    if not volume > 0:
+        raise ValidationError(f"volume must be > 0, got {volume_lots!r}")
+    if step > 0:
+        volume = round(round(volume / step) * step, 8)
+    if min_volume > 0 and volume < min_volume:
+        volume = min_volume
+    if max_volume > 0 and volume > max_volume:
+        volume = max_volume
+    error = _validate_requested_volume(
+        {"volume_min": min_volume, "volume_max": max_volume, "volume_step": step}, volume
+    )
+    if error is not None:
+        raise ValidationError(error)
+    return volume
+
+
+def normalize_price(price: float, *, digits: int) -> float:
+    """Round *price* to *digits* decimals."""
+    try:
+        return round(float(price), int(digits))
+    except (TypeError, ValueError):
+        raise ValidationError(f"price must be a number, got {price!r}") from None
+
+
+def resolve_symbol(symbols: Mapping[str, SymbolInfo], name: str) -> SymbolInfo:
+    """Exact-then-prefix symbol lookup for broker suffixes (``XAUUSD.sml``).
+
+    Tries exact match, case-sensitive prefix, case-insensitive exact, then
+    case-insensitive prefix. Raises :class:`SymbolNotFoundError` when unknown
+    or ambiguous.
+    """
+    key = name.strip() if isinstance(name, str) else ""
+    if not key:
+        raise SymbolNotFoundError(f"unknown symbol: {name!r}")
+    hit = symbols.get(key)
+    if hit is not None:
+        return hit
+    lowered = key.lower()
+    for tier in (
+        [info for sym, info in symbols.items() if sym.startswith(key)],
+        [info for sym, info in symbols.items() if sym.lower() == lowered],
+        [info for sym, info in symbols.items() if sym.lower().startswith(lowered)],
+    ):
+        if len(tier) == 1:
+            return tier[0]
+        if tier:
+            candidates = sorted({info.name for info in tier})
+            raise SymbolNotFoundError(f"ambiguous symbol {name!r}: {candidates}")
+    raise SymbolNotFoundError(f"unknown symbol: {name!r}")
 
 
 def _validate_requested_stops(symbol_info: Record, request: Record, reference_price: float) -> str | None:

@@ -13,6 +13,7 @@ except ImportError:
 from pymt5._dataframe import to_dataframe
 from pymt5._metrics import MetricsCollector
 from pymt5._order_manager import OrderManager, OrderState, PositionSummary, TrackedOrder
+from pymt5._parsers import normalize_price, normalize_volume, resolve_symbol
 from pymt5._pool import MT5ConnectionPool, PoolAccount
 from pymt5._subscription import SubscriptionHandle
 from pymt5.client import (
@@ -258,6 +259,10 @@ __all__ = [
     "TransportState",
     # Subscriptions
     "SubscriptionHandle",
+    # Pure trade helpers
+    "normalize_volume",
+    "normalize_price",
+    "resolve_symbol",
     # DataFrame integration
     "to_dataframe",
     # Events

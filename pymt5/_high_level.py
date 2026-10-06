@@ -9,6 +9,10 @@ integers:
   resolving symbol, volume, or direction first.
 - :meth:`modify_sltp` moves SL/TP by ticket.
 
+Bot helpers on the same mixin: :meth:`resolve_symbol` (broker-suffixed name
+lookup), :meth:`ensure_market_data` (batch tick subscribe), and
+:meth:`get_close_reason` (OPEN / SL_HIT / TP_HIT / CLOSED / UNKNOWN).
+
 Fill discovery (cmd-19 push correlated by action id, falling back to the
 cmd-12 response tickets) stays inside these methods — callers never track
 action ids or poll snapshots. Rejections raise :class:`TradeError` with
@@ -20,12 +24,22 @@ retcode/symbol/action populated; ambiguous timeouts raise
 from __future__ import annotations
 
 import asyncio
+import math
 import random
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
 from pymt5._logging import get_logger
-from pymt5._parsers import _validate_requested_volume
+from pymt5._parsers import (
+    normalize_price,
+    normalize_volume,
+)
+from pymt5._parsers import (
+    resolve_symbol as _resolve_cached_symbol,
+)
 from pymt5.constants import (
+    DEAL_ENTRY_OUT,
+    DEAL_ENTRY_OUT_BY,
     ORDER_FILLING_FOK,
     ORDER_FILLING_IOC,
     ORDER_TYPE_BUY,
@@ -41,7 +55,7 @@ from pymt5.exceptions import MT5TimeoutError, SymbolNotFoundError, TradeError, V
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from pymt5.types import Record, RecordList, TradeResult
+    from pymt5.types import Record, RecordList, SymbolInfo, TradeResult
 
 logger = get_logger("pymt5.high_level")
 
@@ -57,8 +71,25 @@ class _HighLevelMixin:
         async def get_positions(self) -> RecordList: ...
         async def symbol_info(self, symbol: str) -> Record | None: ...
         async def wait_for_trade_result(self, action_id: int, timeout: float = 20.0) -> Record | None: ...
+        async def positions_get(
+            self, symbol: str | None = ..., group: str | None = ..., ticket: int | None = ...
+        ) -> RecordList: ...
+        async def history_deals_get(
+            self,
+            date_from: Any = ...,
+            date_to: Any = ...,
+            *,
+            group: str | None = ...,
+            ticket: int | None = ...,
+            position: int | None = ...,
+        ) -> RecordList: ...
+        async def load_symbols(self, use_gzip: bool = ...) -> dict[str, SymbolInfo]: ...
+        async def subscribe_ticks(self, symbol_ids: list[int]) -> None: ...
         @staticmethod
         def _volume_to_lots(volume: float, precision: int = 8) -> int: ...
+
+    _symbols: dict[str, SymbolInfo]
+    _subscribed_ids: list[int]
 
     def _select_filling(self, info: Record) -> int:
         """Pick type_filling from the symbol fill-flags bitmask.
@@ -78,33 +109,18 @@ class _HighLevelMixin:
     def _normalize_lots(self, info: Record, volume_lots: float) -> float:
         """Round *volume_lots* to the symbol step and clamp to min/max."""
         try:
-            volume = float(volume_lots)
-        except (TypeError, ValueError):
-            raise ValidationError(f"volume must be a number, got {volume_lots!r}") from None
-        if not volume > 0:
-            raise ValidationError(f"volume must be > 0, got {volume_lots!r}")
-        try:
             step = float(info.get("volume_step", 0.0) or 0.0)
             vmin = float(info.get("volume_min", 0.0) or 0.0)
             vmax = float(info.get("volume_max", 0.0) or 0.0)
         except (TypeError, ValueError):
             step = vmin = vmax = 0.0
-        if step > 0:
-            volume = round(round(volume / step) * step, 8)
-        if vmin > 0 and volume < vmin:
-            volume = vmin
-        if vmax > 0 and volume > vmax:
-            volume = vmax
-        error = _validate_requested_volume({"volume_min": vmin, "volume_max": vmax, "volume_step": step}, volume)
-        if error is not None:
-            raise ValidationError(error)
-        return volume
+        return normalize_volume(volume_lots, min_volume=vmin, max_volume=vmax, step=step)
 
     @staticmethod
     def _round_price(value: float | None, digits: int) -> float:
         if value is None:
             return 0.0
-        return round(float(value), digits)
+        return normalize_price(value, digits=digits)
 
     @staticmethod
     def _digits_of(info: Record) -> int:
@@ -333,3 +349,129 @@ class _HighLevelMixin:
                 action=TRADE_ACTION_SLTP,
             )
         return result
+
+    # ---- bot helpers (item 4) ----
+
+    def resolve_symbol(self, name: str) -> SymbolInfo:
+        """Resolve *name* against the symbol cache (exact, then prefix).
+
+        Handles broker suffixes such as ``XAUUSD.sml`` or ``EURUSD+`` when the
+        caller asks for the plain name. Raises :class:`SymbolNotFoundError`
+        when unknown or ambiguous.
+        """
+        return _resolve_cached_symbol(self._symbols, name)
+
+    async def ensure_market_data(self, symbols: list[str]) -> dict[str, int]:
+        """Resolve *symbols* and subscribe tick streams for the missing ones.
+
+        Returns requested-name → symbol-id. Already-subscribed ids are
+        skipped (no resubscribe); unknown names raise
+        :class:`SymbolNotFoundError` listing every miss.
+        """
+        if not symbols:
+            return {}
+        if not self._symbols:
+            await self.load_symbols()
+        resolved: dict[str, SymbolInfo] = {}
+        missing: list[str] = []
+        for name in symbols:
+            try:
+                resolved[name] = _resolve_cached_symbol(self._symbols, name)
+            except SymbolNotFoundError:
+                missing.append(name)
+        if missing:
+            raise SymbolNotFoundError(f"unknown symbols (call load_symbols first): {missing}")
+        ids = sorted({info.symbol_id for info in resolved.values()})
+        fresh = [i for i in ids if i not in set(self._subscribed_ids)]
+        if fresh:
+            await self.subscribe_ticks(fresh)
+        return {name: info.symbol_id for name, info in resolved.items()}
+
+    @staticmethod
+    def _latest_out_deal(deals: RecordList) -> Record | None:
+        outs: RecordList = []
+        for deal in deals:
+            try:
+                is_out = int(deal.get("entry", -1) or -1) in (DEAL_ENTRY_OUT, DEAL_ENTRY_OUT_BY)
+            except (TypeError, ValueError):
+                continue
+            if is_out:
+                outs.append(deal)
+        if not outs:
+            return None
+
+        def _key(deal: Record) -> tuple[int, int]:
+            try:
+                when = int(deal.get("time_create", 0) or 0)
+            except (TypeError, ValueError):
+                when = 0
+            try:
+                ticket = int(deal.get("deal", 0) or 0)
+            except (TypeError, ValueError):
+                ticket = 0
+            return (when, ticket)
+
+        return max(outs, key=_key)
+
+    @staticmethod
+    def _classify_close(deal: Record) -> str:
+        """Decode SL_HIT / TP_HIT / CLOSED from a closing deal.
+
+        Signals in order: deal comment markers (``sl``/``tp`` prefixes, as
+        the terminal renders them), the MQL5 deal-reason codes
+        (SL=4 / TP=5), then close-price proximity to the deal SL/TP levels.
+        Anything else is a plain ``CLOSED``.
+        """
+        comment = str(deal.get("comment", "") or "").strip().lower().lstrip("[(")
+        if comment.startswith("sl"):
+            return "SL_HIT"
+        if comment.startswith("tp"):
+            return "TP_HIT"
+        try:
+            reason = int(deal.get("trade_reason", -1))
+        except (TypeError, ValueError):
+            reason = -1
+        if reason == 4:
+            return "SL_HIT"
+        if reason == 5:
+            return "TP_HIT"
+        close = 0.0
+        for price_key in ("price_close", "price", "price_open"):
+            try:
+                close = float(deal.get(price_key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if close:
+                break
+        if close:
+            for level_key, hit in (("sl", "SL_HIT"), ("tp", "TP_HIT")):
+                try:
+                    level = float(deal.get(level_key, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if level > 0 and math.isclose(close, level, rel_tol=1e-9):
+                    return hit
+        return "CLOSED"
+
+    async def get_close_reason(self, position_id: int, *, lookback_days: float = 90.0) -> tuple[str, Record | None]:
+        """Explain why a position closed: OPEN / SL_HIT / TP_HIT / CLOSED / UNKNOWN.
+
+        Returns ``(reason, closing_deal)``; the deal is None for OPEN and
+        UNKNOWN. Closed positions are found via position-scoped deal lookup,
+        with an explicit time-range retry when the default history window is
+        empty.
+        """
+        try:
+            ticket = int(position_id)
+        except (TypeError, ValueError):
+            raise ValidationError(f"position_id must be an int, got {position_id!r}") from None
+        if await self.positions_get(ticket=ticket):
+            return ("OPEN", None)
+        closing = self._latest_out_deal(await self.history_deals_get(position=ticket))
+        if closing is None and lookback_days > 0:
+            now = int(time.time())
+            start = now - int(float(lookback_days) * 86400)
+            closing = self._latest_out_deal(await self.history_deals_get(start, now, position=ticket))
+        if closing is None:
+            return ("UNKNOWN", None)
+        return (self._classify_close(closing), closing)

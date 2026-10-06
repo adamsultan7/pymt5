@@ -187,3 +187,20 @@ def test_sync_ticket_api_mirrors():
         assert sync.modify_sltp(555, 1.08, 1.09) is ok
     finally:
         sync.close()
+
+
+def test_sync_helper_mirrors():
+    from pymt5.types import SymbolInfo as _SymbolInfo
+
+    sync, inst = _make_sync()
+    try:
+        inst.resolve_symbol = MagicMock(return_value=_SymbolInfo("XAUUSD.sml", 2, 3))
+        assert sync.resolve_symbol("XAUUSD") == _SymbolInfo("XAUUSD.sml", 2, 3)
+
+        inst.ensure_market_data = AsyncMock(return_value={"EURUSD": 1})
+        assert sync.ensure_market_data(["EURUSD"]) == {"EURUSD": 1}
+
+        inst.get_close_reason = AsyncMock(return_value=("SL_HIT", {"deal": 99}))
+        assert sync.get_close_reason(777) == ("SL_HIT", {"deal": 99})
+    finally:
+        sync.close()

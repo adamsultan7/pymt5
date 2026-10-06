@@ -556,6 +556,20 @@ class SyncMT5Client:
         """Move SL/TP of an open position by ticket."""
         return self._call(self._client.modify_sltp(ticket, sl, tp), timeout)
 
+    def resolve_symbol(self, name: str) -> SymbolInfo:
+        """Resolve a symbol name against the cache (exact, then prefix)."""
+        return self._client.resolve_symbol(name)
+
+    def ensure_market_data(self, symbols: list[str], timeout: float | None = None) -> dict[str, int]:
+        """Subscribe tick streams for *symbols*; return name → symbol id."""
+        return self._call(self._client.ensure_market_data(symbols), timeout)
+
+    def get_close_reason(
+        self, position_id: int, lookback_days: float = 90.0, timeout: float | None = None
+    ) -> tuple[str, Record | None]:
+        """Explain why a position closed; see the async API."""
+        return self._call(self._client.get_close_reason(position_id, lookback_days=lookback_days), timeout)
+
     def wait_for_trade_result(self, action_id: int, timeout: float = 20.0) -> Record | None:
         """Block until the cmd-19 push for *action_id* arrives (None on timeout)."""
         call_timeout = timeout + self._timeout if timeout > 0 else self._timeout
