@@ -274,3 +274,15 @@ def test_sync_close_forwards_explicit_routing():
         )
     finally:
         sync.close()
+
+
+def test_sync_fill_mode_accessors():
+    """Filling memory + stats are local reads on the sync mirror."""
+    sync, inst = _make_sync()
+    try:
+        inst.fill_mode_memory = {"EURUSD": 1}
+        assert sync.fill_mode_memory == {"EURUSD": 1}
+        inst.fill_mode_stats = {"fills": 2, "first_try_hit_rate": 0.5}
+        assert sync.fill_mode_stats["first_try_hit_rate"] == 0.5
+    finally:
+        sync.close()

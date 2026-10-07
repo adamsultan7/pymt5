@@ -157,6 +157,17 @@ Strict brokers reject the wrong guess live (FOK sent to an IOC-only symbol),
 so a close that previously died on 10030 now succeeds on the second attempt
 with no caller change; two consecutive 10030s raise ``TradeError``.
 
+Per-symbol filling memory: the mode that fills is remembered per symbol for
+the life of the client (``client.fill_mode_memory``, with hit-rate counters
+in ``client.fill_mode_stats``) and consulted *before* the spec lookup, so
+repeat symbols skip the 10030 probe roundtrip entirely. Some brokers
+(Pepperstone/ICMarkets demo) return no filling fields at all, making the
+first order per symbol burn one failed roundtrip by necessity — every later
+order goes out with the proven mode first. A later 10030 on a remembered
+mode re-triggers the alternate-mode retry and re-records (specs can change).
+Behavior change by design: repeat symbols send the remembered mode instead
+of re-guessing, i.e. fewer failed roundtrips, not different fills.
+
 On requote (retcode 10004) for market orders, ``place_market()`` can retry
 automatically with ``requote_retries`` (default 0 = raise immediately).
 Each retry waits ``requote_delay`` seconds (default: the symbol's

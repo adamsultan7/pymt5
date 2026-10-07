@@ -102,13 +102,15 @@ async def test_place_market_normalizes_volume():
 
 
 async def test_place_market_filling_selection():
-    c = _client()
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=2))  # IOC only
+    # Fresh client per case: memory is empty, so the spec decides each time
+    # (repeat symbols would consult memory first — see the memory tests).
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=2)))  # IOC only
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0))  # unknown -> FOK
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=0)))  # unknown -> FOK
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
+    c = _client()
     await c.place_market("EURUSD", "buy", 0.01, filling=ORDER_FILLING_IOC)  # explicit wins
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
 
@@ -569,21 +571,20 @@ async def test_explicit_short_budget_raises_on_time_without_resend():
 
 async def test_select_filling_reads_full_spec_flags():
     """FOK-only/IOC-only symbols resolve from trade_fill_flags spellings."""
-    c = _client()
-    # Raw top-level trade_fill_flags (basic-cache-shaped record).
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=2))
+    # Fresh client per case: memory is empty, so the spec decides each time.
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=2)))
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
     # Nested under trade (full-spec shape).
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade={"trade_fill_flags": 2}))
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=0, trade={"trade_fill_flags": 2})))
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
     # FOK-only via trade_fill_flags.
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=1))
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=1)))
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
     # Both bits -> FOK preference (legacy default).
-    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=3))
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=3)))
     await c.place_market("EURUSD", "buy", 0.01)
     assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
 
@@ -778,3 +779,133 @@ async def test_close_book_miss_without_routing_is_unknown_not_closed():
         await c.close_position_by_ticket(999, symbol="EURUSD")  # side+volume missing
     assert not isinstance(exc_info.value, PositionAlreadyClosedError)
     c.trade_request.assert_not_awaited()
+
+
+# ---- Filling memory: last working mode per symbol ----
+
+# Spec-blind record, as live Pepperstone/ICMarkets demo return it: no
+# filling/trade_mode fields, so auto-detect can only guess FOK.
+BLIND_INFO = {"digits": 5, "volume_min": 0.01, "volume_max": 10.0, "volume_step": 0.01, "filling_mode": 0}
+
+
+def _invalid_fill() -> TradeResult:
+    return TradeResult(retcode=10030, description="Invalid filling", success=False)
+
+
+def _filled_push(ticket: int = 555) -> dict:
+    return {"trade_order": 0, "trade_position": ticket, "retcode": 10009}
+
+
+async def test_fill_memory_records_fallback_then_hits_first_try():
+    """10030 flips the memory; the next order sends it FIRST, one roundtrip."""
+    c = _client(
+        symbol_info=AsyncMock(return_value=dict(BLIND_INFO)),
+        trade_request=AsyncMock(side_effect=[_invalid_fill(), _ok(), _ok()]),
+        wait_for_trade_result=AsyncMock(return_value=_filled_push()),
+    )
+    assert c.fill_mode_memory == {}
+    assert c.fill_mode_stats["first_try_hit_rate"] is None
+    assert await c.place_market("EURUSD", "buy", 0.01) == 555
+    assert c.trade_request.await_count == 2
+    first, second = c.trade_request.call_args_list
+    assert first.kwargs["type_filling"] == ORDER_FILLING_FOK  # blind guess
+    assert second.kwargs["type_filling"] == ORDER_FILLING_IOC  # flipped
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_IOC}
+    assert await c.place_market("EURUSD", "buy", 0.01) == 555
+    assert c.trade_request.await_count == 3  # single roundtrip, no probe
+    assert c.trade_request.call_args_list[-1].kwargs["type_filling"] == ORDER_FILLING_IOC
+    stats = c.fill_mode_stats
+    assert stats["fills"] == 2
+    assert stats["first_try_fills"] == 1
+    assert stats["fallback_sends"] == 1
+    assert stats["first_try_hit_rate"] == pytest.approx(0.5)
+
+
+async def test_fill_memory_rerecords_when_spec_changes():
+    """A later 10030 on the remembered mode retries the alternate and re-records."""
+    c = _client(
+        symbol_info=AsyncMock(return_value=dict(BLIND_INFO)),
+        trade_request=AsyncMock(side_effect=[_invalid_fill(), _ok(), _invalid_fill(), _ok()]),
+        wait_for_trade_result=AsyncMock(return_value=_filled_push()),
+    )
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_IOC}
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.trade_request.await_count == 4
+    modes = [call.kwargs["type_filling"] for call in c.trade_request.call_args_list]
+    assert modes == [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_IOC, ORDER_FILLING_FOK]
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_FOK}
+
+
+async def test_fill_memory_unknown_symbol_keeps_spec_behavior():
+    """No memory -> spec lookup exactly as before, then learned."""
+    c = _client(symbol_info=AsyncMock(return_value=dict(INFO, filling_mode=2)))  # IOC-only spec
+    assert await c.place_market("EURUSD", "buy", 0.01) == 555
+    assert c.trade_request.await_count == 1
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_IOC}
+
+
+async def test_fill_memory_does_not_cross_contaminate_symbols():
+    """EURUSD=IOC leaves FOK-only and blind symbols untouched."""
+    c = _client(symbol_info=AsyncMock(return_value=dict(BLIND_INFO)))
+    c.trade_request = AsyncMock(side_effect=[_invalid_fill(), _ok()])
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_IOC}
+    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=1))  # FOK-only spec
+    c.trade_request = AsyncMock(return_value=_ok())
+    await c.place_market("GBPUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
+    c.symbol_info = AsyncMock(return_value=dict(BLIND_INFO))  # blind too: default, not IOC
+    c.trade_request = AsyncMock(return_value=_ok())
+    await c.place_market("GBPUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_IOC, "GBPUSD": ORDER_FILLING_FOK}
+
+
+async def test_fill_memory_amortizes_probe_over_repeat_orders():
+    """Mocked 10030-on-FOK broker, 5 orders: 6 sends (2+1+1+1+1), not 10."""
+
+    async def _broker_10030_on_fok(**kwargs):
+        if kwargs.get("type_filling") == ORDER_FILLING_FOK:
+            return _invalid_fill()
+        return _ok()
+
+    c = _client(
+        symbol_info=AsyncMock(return_value=dict(BLIND_INFO)),
+        trade_request=AsyncMock(side_effect=_broker_10030_on_fok),
+        wait_for_trade_result=AsyncMock(return_value=_filled_push()),
+    )
+    for _ in range(5):
+        assert await c.place_market("EURUSD", "buy", 0.01) == 555
+    assert c.trade_request.await_count == 6
+    stats = c.fill_mode_stats
+    assert (stats["fills"], stats["first_try_fills"], stats["fallback_sends"]) == (5, 4, 1)
+    assert stats["first_try_hit_rate"] == pytest.approx(0.8)
+
+
+async def test_explicit_filling_overrides_memory():
+    """Explicit filling= wins over the remembered mode on the wire."""
+    c = _client(symbol_info=AsyncMock(return_value=dict(BLIND_INFO)))
+    c._fill_mode_memory["EURUSD"] = ORDER_FILLING_FOK
+    c.trade_request = AsyncMock(return_value=_ok())
+    await c.place_market("EURUSD", "buy", 0.01, filling=ORDER_FILLING_IOC)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+
+
+async def test_close_uses_remembered_filling():
+    """The close path consults memory before the spec lookup."""
+    c = _client(symbol_info=AsyncMock(return_value=dict(BLIND_INFO)))
+    c._fill_mode_memory["EURUSD"] = ORDER_FILLING_IOC
+    await c.close_position_by_ticket(777)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+
+
+async def test_fill_mode_memory_accessor_is_read_only_copy():
+    c = _client()
+    await c.place_market("EURUSD", "buy", 0.01)  # INFO mode 1 -> FOK, success
+    mem = c.fill_mode_memory
+    assert mem == {"EURUSD": ORDER_FILLING_FOK}
+    mem["EURUSD"] = ORDER_FILLING_IOC
+    mem["XAUUSD"] = ORDER_FILLING_IOC
+    assert c.fill_mode_memory == {"EURUSD": ORDER_FILLING_FOK}

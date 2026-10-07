@@ -251,6 +251,16 @@ class SyncMT5Client:
     def symbol_names(self) -> list[str]:
         return self._client.symbol_names
 
+    @property
+    def fill_mode_memory(self) -> dict[str, int]:
+        """Last working type_filling per symbol (read-only copy; never blocks)."""
+        return self._client.fill_mode_memory
+
+    @property
+    def fill_mode_stats(self) -> dict[str, Any]:
+        """Filling observability snapshot (local read, never blocks)."""
+        return self._client.fill_mode_stats
+
     def symbol_select(self, symbol: str, enable: bool = True, timeout: float | None = None) -> bool:
         return self._call(self._client.symbol_select(symbol, enable), timeout)
 

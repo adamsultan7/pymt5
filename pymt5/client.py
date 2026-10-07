@@ -141,6 +141,14 @@ class MT5WebClient(
         self._symbols: dict[str, SymbolInfo] = {}
         self._symbols_by_id: dict[int, SymbolInfo] = {}
         self._full_symbols: dict[str, Record] = {}
+        # Per-symbol working fill mode: last type_filling that filled per
+        # symbol, consulted before the spec lookup (brokers that omit fill
+        # flags can never auto-detect). Lifetime = client lifetime; a later
+        # 10030 re-triggers the alternate-mode retry and re-records.
+        self._fill_mode_memory: dict[str, int] = {}
+        self._fills_resolved: int = 0
+        self._fills_first_try: int = 0
+        self._fill_fallback_sends: int = 0
         self._symbol_cache_ttl: float = max(0.0, float(symbol_cache_ttl))
         self._symbols_loaded_at: float = 0.0
         self._tick_cache_by_id: dict[int, Record] = {}

@@ -43,6 +43,7 @@ from pymt5.constants import (
     DEAL_ENTRY_OUT_BY,
     ORDER_FILLING_FOK,
     ORDER_FILLING_IOC,
+    ORDER_FILLING_RETURN,
     ORDER_TYPE_BUY,
     ORDER_TYPE_SELL,
     POSITION_TYPE_BUY,
@@ -173,6 +174,67 @@ class _HighLevelMixin:
 
     _symbols: dict[str, SymbolInfo]
     _subscribed_ids: list[int]
+    _fill_mode_memory: dict[str, int]
+    _fills_resolved: int
+    _fills_first_try: int
+    _fill_fallback_sends: int
+
+    def _remember_filling(self, symbol: str, filling: int) -> None:
+        """Record the fill mode that just worked for *symbol*.
+
+        Only stores real modes (FOK/IOC/RETURN); anything else is ignored.
+        A later 10030 on the remembered mode re-triggers the existing
+        alternate-mode retry, which re-records on success.
+        """
+        try:
+            mode = int(filling)
+        except (TypeError, ValueError):
+            return
+        if mode not in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
+            return
+        self._fill_mode_memory[symbol] = mode
+
+    def _select_filling_for(self, symbol: str, info: Record) -> int:
+        """Pick type_filling for *symbol*: remembered mode first, then spec.
+
+        Brokers that omit fill flags from the symbol spec (live:
+        Pepperstone/ICMarkets demo return no filling/trade_mode fields) can
+        never auto-detect, so the last mode that filled for this symbol wins
+        over the spec lookup. Falls back to :meth:`_select_filling` (spec,
+        then FOK default) when nothing is remembered for the symbol.
+        """
+        remembered = self._fill_mode_memory.get(symbol)
+        if remembered in (ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN):
+            return remembered
+        return self._select_filling(info)
+
+    @property
+    def fill_mode_memory(self) -> dict[str, int]:
+        """Last working ``type_filling`` per symbol (read-only copy).
+
+        Consulted before the spec lookup on every market order/close, so
+        repeat symbols skip the 10030 probe roundtrip. Empty until the
+        first fill resolves.
+        """
+        return dict(self._fill_mode_memory)
+
+    @property
+    def fill_mode_stats(self) -> dict[str, Any]:
+        """Filling observability snapshot for bots logging hit rates.
+
+        Keys: ``memory`` (symbol -> mode copy), ``fills`` (resolved total),
+        ``first_try_fills`` (resolved without a filling flip),
+        ``fallback_sends`` (alternate-mode attempts sent),
+        ``first_try_hit_rate`` (None until the first resolved fill).
+        """
+        fills = self._fills_resolved
+        return {
+            "memory": dict(self._fill_mode_memory),
+            "fills": fills,
+            "first_try_fills": self._fills_first_try,
+            "fallback_sends": self._fill_fallback_sends,
+            "first_try_hit_rate": (self._fills_first_try / fills) if fills else None,
+        }
 
     def _select_filling(self, info: Record) -> int:
         """Pick type_filling from the symbol fill-flags bitmask.
@@ -398,7 +460,7 @@ class _HighLevelMixin:
                 raise
             if result.success:
                 try:
-                    return await self._resolve_fill(
+                    ticket = await self._resolve_fill(
                         waiter=waiter, result=result, symbol=symbol, trade_action=trade_action, closing=closing
                     )
                 except _PushRequote as rq:
@@ -437,6 +499,7 @@ class _HighLevelMixin:
                     ):
                         fill_fallback_used = True
                         attempt_filling = _flip_filling(attempt_filling)
+                        self._fill_fallback_sends += 1
                         logger.info(
                             "invalid filling (10030) on %s; retrying once with type_filling=%s",
                             symbol,
@@ -444,6 +507,11 @@ class _HighLevelMixin:
                         )
                         continue
                     raise
+                self._remember_filling(symbol, attempt_filling)
+                self._fills_resolved += 1
+                if not fill_fallback_used:
+                    self._fills_first_try += 1
+                return ticket
             waiter.cancel()
             if (
                 result.retcode == TRADE_RETCODE_INVALID_FILL
@@ -452,6 +520,7 @@ class _HighLevelMixin:
             ):
                 fill_fallback_used = True
                 attempt_filling = _flip_filling(attempt_filling)
+                self._fill_fallback_sends += 1
                 logger.info(
                     "invalid filling (10030) on %s; retrying once with type_filling=%s",
                     symbol,
@@ -508,6 +577,10 @@ class _HighLevelMixin:
         Raises :class:`TradeError` on rejection and :class:`MT5TimeoutError`
         when the fill cannot be confirmed (fail closed, never resent).
 
+        The fill mode is explicit ``filling=`` when given, else the
+        remembered mode for this symbol, else the spec auto-detect (see
+        :meth:`fill_mode_memory`).
+
         On requote (retcode 10004) with ``requote_retries > 0``, the order is
         resent automatically after ``requote_delay`` seconds (default: the
         symbol's ``trade.lf`` field, else 7.0s) at the refreshed requote
@@ -526,7 +599,7 @@ class _HighLevelMixin:
             trade_action=TRADE_ACTION_DEAL,
             volume_proto=self._volume_to_lots(self._normalize_lots(info, volume_lots)),
             digits=digits,
-            filling=filling if filling is not None else self._select_filling(info),
+            filling=filling if filling is not None else self._select_filling_for(symbol, info),
             trade_type=order_type,
             price_sl=self._round_price(sl, digits),
             price_tp=self._round_price(tp, digits),
@@ -593,7 +666,8 @@ class _HighLevelMixin:
         poll entirely (stale-book closes, or a just-opened position whose row
         has not appeared yet). ``side`` is the *position* side (``"buy"``
         closes a long with a sell). ``filling`` overrides the auto-detected
-        fill mode. Without a book row and without full explicit routing the
+        fill mode (remembered mode for this symbol, else the spec). Without
+        a book row and without full explicit routing the
         close cannot be built: that raises generic :class:`TradeError`
         (unknown position — explicitly NOT already-closed) without sending.
         """
@@ -655,7 +729,7 @@ class _HighLevelMixin:
             trade_action=TRADE_ACTION_DEAL,
             volume_proto=volume_proto,
             digits=self._digits_of(info),
-            filling=filling if filling is not None else self._select_filling(info),
+            filling=filling if filling is not None else self._select_filling_for(resolved_symbol, info),
             trade_type=close_type,
             deviation=deviation,
             comment=comment,
