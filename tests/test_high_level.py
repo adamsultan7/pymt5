@@ -560,3 +560,64 @@ async def test_explicit_short_budget_raises_on_time_without_resend():
     budget = c.wait_for_trade_result.call_args.kwargs["timeout"]
     assert 0 < budget <= 0.05
     assert c.trade_request.await_count == 1
+
+
+# ---- Item 1: filling must be real (full-spec flags + 10030 fallback) ----
+
+
+async def test_select_filling_reads_full_spec_flags():
+    """FOK-only/IOC-only symbols resolve from trade_fill_flags spellings."""
+    c = _client()
+    # Raw top-level trade_fill_flags (basic-cache-shaped record).
+    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=2))
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+    # Nested under trade (full-spec shape).
+    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade={"trade_fill_flags": 2}))
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+    # FOK-only via trade_fill_flags.
+    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=1))
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
+    # Both bits -> FOK preference (legacy default).
+    c.symbol_info = AsyncMock(return_value=dict(INFO, filling_mode=0, trade_fill_flags=3))
+    await c.place_market("EURUSD", "buy", 0.01)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK
+
+
+async def test_invalid_fill_ack_fallback_retries_once_flipped():
+    """10030 ack reject retries once with the alternate mode in-budget."""
+    from pymt5.constants import TRADE_RETCODE_INVALID_FILL
+
+    bad = TradeResult(retcode=TRADE_RETCODE_INVALID_FILL, description="Invalid filling", success=False)
+    c = _client(trade_request=AsyncMock(side_effect=[bad, _ok()]))
+    ticket = await c.place_market("EURUSD", "buy", 0.01)
+    assert ticket == 555
+    assert c.trade_request.await_count == 2
+    first, second = c.trade_request.call_args_list
+    assert first.kwargs["type_filling"] == ORDER_FILLING_FOK
+    assert second.kwargs["type_filling"] == ORDER_FILLING_IOC
+    assert first.kwargs["action_id"] != second.kwargs["action_id"]
+
+
+async def test_invalid_fill_fails_closed_after_single_retry():
+    """A second 10030 raises — no endless filling flip-flop, no resend beyond."""
+    from pymt5.constants import TRADE_RETCODE_INVALID_FILL
+
+    bad = TradeResult(retcode=TRADE_RETCODE_INVALID_FILL, description="Invalid filling", success=False)
+    c = _client(trade_request=AsyncMock(side_effect=[bad, bad]))
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == TRADE_RETCODE_INVALID_FILL
+    assert c.trade_request.await_count == 2
+
+
+async def test_close_position_by_ticket_accepts_explicit_filling():
+    """filling= passes through end to end; auto-detect otherwise."""
+    c = _client()
+    await c.close_position_by_ticket(777, filling=ORDER_FILLING_IOC)
+    assert c.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_IOC
+    c2 = _client()
+    await c2.close_position_by_ticket(777)
+    assert c2.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK  # INFO mode 1

@@ -241,3 +241,16 @@ def test_sync_zero_ticket_push_raises_trade_error():
         assert exc_info.value.retcode == 10031
     finally:
         sync.close()
+
+
+def test_sync_close_forwards_filling():
+    """Item 1: close_position_by_ticket accepts filling= end to end."""
+    sync, inst = _make_sync()
+    try:
+        inst.close_position_by_ticket = AsyncMock(return_value=666)
+        assert sync.close_position_by_ticket(555, filling=1) == 666
+        inst.close_position_by_ticket.assert_awaited_once_with(
+            555, deviation=20, comment="", volume_lots=None, fill_timeout=30.0, filling=1
+        )
+    finally:
+        sync.close()

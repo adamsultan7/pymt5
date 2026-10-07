@@ -47,8 +47,13 @@ from pymt5.constants import (
     ORDER_TYPE_SELL,
     POSITION_TYPE_BUY,
     TRADE_ACTION_DEAL,
+    TRADE_ACTION_PENDING,
     TRADE_ACTION_SLTP,
     TRADE_RETCODE_DESCRIPTIONS,
+    TRADE_RETCODE_DONE,
+    TRADE_RETCODE_DONE_PARTIAL,
+    TRADE_RETCODE_INVALID_FILL,
+    TRADE_RETCODE_PLACED,
     TRADE_RETCODE_POSITION_CLOSED,
     TRADE_RETCODE_REQUOTE,
 )
@@ -69,6 +74,17 @@ logger = get_logger("pymt5.high_level")
 
 _SIDE_TO_ORDER_TYPE = {"buy": ORDER_TYPE_BUY, "sell": ORDER_TYPE_SELL}
 
+# Push verdicts that confirm execution: pending placement (10008), market
+# fill (10009), partial fill (10010). Only these may resolve a ticket from
+# the push — every other final code is a rejection, even when the push
+# echoes nonzero ticket fields (the 10030 reject echo carries the requested
+# position id, not a deal).
+_FINAL_SUCCESS_CODES = frozenset({TRADE_RETCODE_PLACED, TRADE_RETCODE_DONE, TRADE_RETCODE_DONE_PARTIAL})
+
+# Market and pending orders carry type_filling, so only these get the single
+# alternate-mode retry on 10030 (SLTP/MODIFY/REMOVE do not use filling).
+_FILL_RETRY_ACTIONS = frozenset({TRADE_ACTION_DEAL, TRADE_ACTION_PENDING})
+
 
 class _PushRequote(Exception):
     """Internal: final push reports requote despite cmd-12 success.
@@ -81,6 +97,15 @@ class _PushRequote(Exception):
         super().__init__("requote")
         self.bid = bid
         self.ask = ask
+
+
+def _flip_filling(filling: int) -> int:
+    """Alternate fill mode for the single 10030 retry (FOK <-> IOC)."""
+    try:
+        mode = int(filling)
+    except (TypeError, ValueError):
+        mode = ORDER_FILLING_FOK
+    return ORDER_FILLING_IOC if mode == ORDER_FILLING_FOK else ORDER_FILLING_FOK
 
 
 def _push_float(push: Record, key: str) -> float:
@@ -152,14 +177,29 @@ class _HighLevelMixin:
     def _select_filling(self, info: Record) -> int:
         """Pick type_filling from the symbol fill-flags bitmask.
 
-        MQL5 ``SYMBOL_FILLING_FOK=1`` / ``SYMBOL_FILLING_IOC=2`` map onto
+        Reads the full symbol spec (``filling_mode``, normalized from
+        ``trade_fill_flags`` by full-symbol parsing), falling back to the raw
+        ``trade_fill_flags`` keys — top level or nested under ``trade`` — for
+        records from caches that lack the normalized field. MQL5
+        ``SYMBOL_FILLING_FOK=1`` / ``SYMBOL_FILLING_IOC=2`` map onto
         ``ORDER_FILLING_FOK=0`` / ``ORDER_FILLING_IOC=1``. Unknown (0) keeps
         the legacy FOK default.
         """
-        try:
-            mode = int(info.get("filling_mode", 0) or 0)
-        except (TypeError, ValueError):
-            mode = 0
+        mode = 0
+        for source in (info.get("filling_mode", 0), info.get("trade_fill_flags", 0)):
+            try:
+                mode = int(source or 0)
+            except (TypeError, ValueError):
+                continue
+            if mode:
+                break
+        if not mode:
+            trade = info.get("trade")
+            if isinstance(trade, dict):
+                try:
+                    mode = int(trade.get("trade_fill_flags", 0) or 0)
+                except (TypeError, ValueError):
+                    mode = 0
         if mode & 2 and not (mode & 1):
             return ORDER_FILLING_IOC
         return ORDER_FILLING_FOK
@@ -302,6 +342,8 @@ class _HighLevelMixin:
         deadline = t0 + fill_timeout
         price = price_order
         retries_left = int(requote_retries)
+        attempt_filling = filling
+        fill_fallback_used = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -320,7 +362,7 @@ class _HighLevelMixin:
                     volume=volume_proto,
                     digits=digits,
                     trade_type=trade_type,
-                    type_filling=filling,
+                    type_filling=attempt_filling,
                     price_order=price,
                     price_sl=price_sl,
                     price_tp=price_tp,
@@ -360,7 +402,39 @@ class _HighLevelMixin:
                     )
                     await asyncio.sleep(delay)
                     continue
+                except TradeError as exc:
+                    # Invalid filling (10030) reports the guess was wrong —
+                    # retry once with the alternate mode inside the same
+                    # budget (covers both the ack reject and the push
+                    # reject-echo paths), then fail closed.
+                    if (
+                        exc.retcode == TRADE_RETCODE_INVALID_FILL
+                        and not fill_fallback_used
+                        and trade_action in _FILL_RETRY_ACTIONS
+                    ):
+                        fill_fallback_used = True
+                        attempt_filling = _flip_filling(attempt_filling)
+                        logger.info(
+                            "invalid filling (10030) on %s; retrying once with type_filling=%s",
+                            symbol,
+                            attempt_filling,
+                        )
+                        continue
+                    raise
             waiter.cancel()
+            if (
+                result.retcode == TRADE_RETCODE_INVALID_FILL
+                and not fill_fallback_used
+                and trade_action in _FILL_RETRY_ACTIONS
+            ):
+                fill_fallback_used = True
+                attempt_filling = _flip_filling(attempt_filling)
+                logger.info(
+                    "invalid filling (10030) on %s; retrying once with type_filling=%s",
+                    symbol,
+                    attempt_filling,
+                )
+                continue
             desc = result.description or TRADE_RETCODE_DESCRIPTIONS.get(result.retcode, "")
             if result.retcode == TRADE_RETCODE_REQUOTE and trade_action == TRADE_ACTION_DEAL and retries_left > 0:
                 retries_left -= 1
@@ -474,8 +548,14 @@ class _HighLevelMixin:
         comment: str = "",
         volume_lots: float | None = None,
         fill_timeout: float = 30.0,
+        filling: int | None = None,
     ) -> int:
-        """Close an open position by ticket; return the closing deal ticket."""
+        """Close an open position by ticket; return the closing deal ticket.
+
+        ``filling`` overrides the auto-detected fill mode (from the full
+        symbol spec); without it the mode is auto-detected, with a single
+        alternate-mode retry inside ``fill_timeout`` on 10030.
+        """
         position = await self._position_or_raise(ticket, for_close=True)
         symbol = str(position.get("trade_symbol", "") or "")
         if not symbol:
@@ -506,7 +586,7 @@ class _HighLevelMixin:
             trade_action=TRADE_ACTION_DEAL,
             volume_proto=volume_proto,
             digits=self._digits_of(info),
-            filling=self._select_filling(info),
+            filling=filling if filling is not None else self._select_filling(info),
             trade_type=ORDER_TYPE_SELL if is_buy else ORDER_TYPE_BUY,
             deviation=deviation,
             comment=comment,

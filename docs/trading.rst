@@ -126,6 +126,16 @@ unconditional 3 mirrors proven production behavior on Pepperstone/MetaQuotes
 demo servers, though exchange-execution symbols may later need the
 per-symbol ``trade_exemode``.
 
+Fill mode is auto-detected from the full symbol spec (``trade_fill_flags``:
+FOK-only symbols get ``ORDER_FILLING_FOK``, IOC-only symbols get
+``ORDER_FILLING_IOC``), pass ``filling=`` explicitly to override — including
+on ``close_position_by_ticket()``, which previously had no override. On
+``10030`` (invalid filling) the request is retried **once** with the
+alternate mode inside the same ``fill_timeout`` budget, then fails closed.
+Strict brokers reject the wrong guess live (FOK sent to an IOC-only symbol),
+so a close that previously died on 10030 now succeeds on the second attempt
+with no caller change; two consecutive 10030s raise ``TradeError``.
+
 On requote (retcode 10004) for market orders, ``place_market()`` can retry
 automatically with ``requote_retries`` (default 0 = raise immediately).
 Each retry waits ``requote_delay`` seconds (default: the symbol's

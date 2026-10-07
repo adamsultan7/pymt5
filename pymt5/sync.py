@@ -544,6 +544,7 @@ class SyncMT5Client:
         comment: str = "",
         volume_lots: float | None = None,
         fill_timeout: float = 30.0,
+        filling: int | None = None,
         timeout: float | None = None,
     ) -> int:
         """Close an open position by ticket; return the closing deal ticket."""
@@ -554,6 +555,7 @@ class SyncMT5Client:
                 comment=comment,
                 volume_lots=volume_lots,
                 fill_timeout=fill_timeout,
+                filling=filling,
             ),
             timeout,
         )
