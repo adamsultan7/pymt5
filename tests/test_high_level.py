@@ -322,13 +322,15 @@ async def test_close_already_closed_raises_dedicated_subclass():
     assert isinstance(exc_info.value, TradeError)  # back-compat with TradeError
 
 
-async def test_close_gone_before_send_raises_dedicated_subclass():
-    """Provably missing at pre-flight is also already-closed."""
+async def test_close_gone_before_send_is_unknown_not_closed():
+    """Item 3: a book miss without explicit routing is UNKNOWN, never AlreadyClosed."""
     from pymt5 import PositionAlreadyClosedError
 
     c = _client(get_positions=AsyncMock(return_value=[]))
-    with pytest.raises(PositionAlreadyClosedError):
+    with pytest.raises(TradeError) as exc_info:
         await c.close_position_by_ticket(999)
+    assert not isinstance(exc_info.value, PositionAlreadyClosedError)
+    assert exc_info.value.retcode == 10036  # retcode signal kept, type fixed
     c.trade_request.assert_not_awaited()
 
 
@@ -719,3 +721,60 @@ async def test_pending_success_push_resolves_order_ticket():
         fill_timeout=5.0,
     )
     assert ticket == 123456
+
+
+# ---- Item 3: unconditional closes, server-authoritative already-closed ----
+
+
+async def test_close_cold_book_with_explicit_routing_sends():
+    """Cold book + full explicit routing skips the poll and sends."""
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    ticket = await c.close_position_by_ticket(777, symbol="EURUSD", side="buy", volume_lots=0.01)
+    assert ticket == 555
+    c.get_positions.assert_not_awaited()
+    kwargs = c.trade_request.call_args.kwargs
+    assert kwargs["symbol"] == "EURUSD"
+    assert kwargs["position_id"] == 777
+    assert kwargs["trade_type"] == ORDER_TYPE_SELL  # long closed with sell
+    assert kwargs["volume"] == 1_000_000
+    assert kwargs["type_filling"] == ORDER_FILLING_FOK  # INFO mode 1
+
+
+async def test_close_cold_book_sell_side_routing():
+    """Explicit side=sell closes a short with a buy."""
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    await c.close_position_by_ticket(777, symbol="EURUSD", side="sell", volume_lots=0.01)
+    assert c.trade_request.call_args.kwargs["trade_type"] == ORDER_TYPE_BUY
+
+
+async def test_close_explicit_routing_validates_side():
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    with pytest.raises(ValidationError):
+        await c.close_position_by_ticket(777, symbol="EURUSD", side="hold", volume_lots=0.01)
+    c.trade_request.assert_not_awaited()
+
+
+async def test_close_genuinely_gone_surfaces_already_closed_from_server():
+    """The server verdict — not the local lookup — declares already-closed."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(
+        get_positions=AsyncMock(return_value=[]),
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value=_reject_push(10036)),
+    )
+    with pytest.raises(PositionAlreadyClosedError) as exc_info:
+        await c.close_position_by_ticket(777, symbol="EURUSD", side="buy", volume_lots=0.01)
+    assert exc_info.value.retcode == 10036
+    assert c.trade_request.await_count == 1  # sent; the SERVER decided
+
+
+async def test_close_book_miss_without_routing_is_unknown_not_closed():
+    """Miss + partial routing: generic TradeError, nothing sent."""
+    from pymt5 import PositionAlreadyClosedError
+
+    c = _client(get_positions=AsyncMock(return_value=[]))
+    with pytest.raises(TradeError) as exc_info:
+        await c.close_position_by_ticket(999, symbol="EURUSD")  # side+volume missing
+    assert not isinstance(exc_info.value, PositionAlreadyClosedError)
+    c.trade_request.assert_not_awaited()

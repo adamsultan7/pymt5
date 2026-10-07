@@ -538,7 +538,7 @@ class _HighLevelMixin:
             requote_lf=self._requote_lf_of(info),
         )
 
-    async def _position_or_raise(self, ticket: int, *, for_close: bool = False) -> Record:
+    async def _position_or_raise(self, ticket: int) -> Record:
         positions = await self.get_positions()
         for position in positions:
             try:
@@ -546,22 +546,28 @@ class _HighLevelMixin:
                     return position
             except (TypeError, ValueError):
                 continue
-        message = f"position {ticket} not found among open positions (already closed?)"
-        if for_close:
-            # Provably gone before we sent anything: closing an already-closed
-            # position is the desired end-state, not a retryable failure.
-            raise PositionAlreadyClosedError(
-                message,
-                retcode=TRADE_RETCODE_POSITION_CLOSED,
-                symbol="",
-                action=TRADE_ACTION_DEAL,
-            )
         raise TradeError(
-            message,
+            f"position {ticket} not found among open positions (already closed?)",
             retcode=TRADE_RETCODE_POSITION_CLOSED,
             symbol="",
             action=TRADE_ACTION_DEAL,
         )
+
+    async def _find_position(self, ticket: int) -> Record | None:
+        """Return the open-position row for *ticket*, or None on a book miss.
+
+        Never raises: a row missing from this poll is "not seen" (cold or
+        lagging book — proven live on sub-second-old positions), never proof
+        of closure. Only the server verdict decides that.
+        """
+        positions = await self.get_positions()
+        for position in positions:
+            try:
+                if int(position.get("position_id", 0) or 0) == int(ticket):
+                    return position
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def close_position_by_ticket(
         self,
@@ -572,48 +578,88 @@ class _HighLevelMixin:
         volume_lots: float | None = None,
         fill_timeout: float = 30.0,
         filling: int | None = None,
+        symbol: str | None = None,
+        side: str | None = None,
     ) -> int:
         """Close an open position by ticket; return the closing deal ticket.
 
-        ``filling`` overrides the auto-detected fill mode (from the full
-        symbol spec); without it the mode is auto-detected, with a single
-        alternate-mode retry inside ``fill_timeout`` on 10030.
+        The close is sent unconditionally, like the reference client: a
+        position missing from the book poll is never proof of closure
+        (push-vs-snapshot lag misfires on live positions), so there is no
+        local gate — the SERVER verdict decides, and a genuine already-closed
+        surfaces as :class:`PositionAlreadyClosedError` from that verdict.
+
+        Pass ``symbol``/``side``/``volume_lots`` explicitly to skip the book
+        poll entirely (stale-book closes, or a just-opened position whose row
+        has not appeared yet). ``side`` is the *position* side (``"buy"``
+        closes a long with a sell). ``filling`` overrides the auto-detected
+        fill mode. Without a book row and without full explicit routing the
+        close cannot be built: that raises generic :class:`TradeError`
+        (unknown position — explicitly NOT already-closed) without sending.
         """
-        position = await self._position_or_raise(ticket, for_close=True)
-        symbol = str(position.get("trade_symbol", "") or "")
-        if not symbol:
-            raise TradeError(
-                f"position {ticket} has no symbol",
-                retcode=TRADE_RETCODE_POSITION_CLOSED,
-                symbol="",
-                action=TRADE_ACTION_DEAL,
-            )
-        info = await self._symbol_info_or_raise(symbol)
-        is_buy = int(position.get("trade_action", 0) or 0) == POSITION_TYPE_BUY
-        if volume_lots is None:
+        try:
+            wanted = int(ticket)
+        except (TypeError, ValueError):
+            raise ValidationError(f"ticket must be an int, got {ticket!r}") from None
+        explicit_side: int | None = None
+        if side is not None:
             try:
-                volume_proto = int(position.get("trade_volume", 0) or 0)
-            except (TypeError, ValueError):
-                volume_proto = 0
-            if volume_proto <= 0:
+                explicit_side = _SIDE_TO_ORDER_TYPE[str(side).strip().lower()]
+            except (KeyError, AttributeError):
+                raise ValidationError(f"side must be 'buy' or 'sell', got {side!r}") from None
+        position: Record | None = None
+        if symbol is None or explicit_side is None or volume_lots is None:
+            position = await self._find_position(wanted)
+        if position is not None:
+            resolved_symbol = str(position.get("trade_symbol", "") or "")
+            if not resolved_symbol:
                 raise TradeError(
-                    f"position {ticket} has no volume",
+                    f"position {wanted} has no symbol",
                     retcode=TRADE_RETCODE_POSITION_CLOSED,
-                    symbol=symbol,
+                    symbol="",
                     action=TRADE_ACTION_DEAL,
                 )
+            info = await self._symbol_info_or_raise(resolved_symbol)
+            is_buy = int(position.get("trade_action", 0) or 0) == POSITION_TYPE_BUY
+            if volume_lots is None:
+                try:
+                    volume_proto = int(position.get("trade_volume", 0) or 0)
+                except (TypeError, ValueError):
+                    volume_proto = 0
+                if volume_proto <= 0:
+                    raise TradeError(
+                        f"position {wanted} has no volume",
+                        retcode=TRADE_RETCODE_POSITION_CLOSED,
+                        symbol=resolved_symbol,
+                        action=TRADE_ACTION_DEAL,
+                    )
+            else:
+                volume_proto = self._volume_to_lots(self._normalize_lots(info, volume_lots))
+            close_type = ORDER_TYPE_SELL if is_buy else ORDER_TYPE_BUY
         else:
+            if symbol is None or explicit_side is None or volume_lots is None:
+                raise TradeError(
+                    f"position {wanted} not found among open positions; "
+                    "pass symbol/side/volume_lots explicitly or reconcile with positions_get()",
+                    retcode=TRADE_RETCODE_POSITION_CLOSED,
+                    symbol=symbol or "",
+                    action=TRADE_ACTION_DEAL,
+                )
+            # Full explicit routing: no book row needed, send unconditionally.
+            info = await self._symbol_info_or_raise(symbol)
             volume_proto = self._volume_to_lots(self._normalize_lots(info, volume_lots))
+            close_type = ORDER_TYPE_SELL if explicit_side == ORDER_TYPE_BUY else ORDER_TYPE_BUY
+            resolved_symbol = symbol
         return await self._place_with_fill(
-            symbol=symbol,
+            symbol=resolved_symbol,
             trade_action=TRADE_ACTION_DEAL,
             volume_proto=volume_proto,
             digits=self._digits_of(info),
             filling=filling if filling is not None else self._select_filling(info),
-            trade_type=ORDER_TYPE_SELL if is_buy else ORDER_TYPE_BUY,
+            trade_type=close_type,
             deviation=deviation,
             comment=comment,
-            position_id=int(ticket),
+            position_id=wanted,
             fill_timeout=fill_timeout,
             closing=True,
         )

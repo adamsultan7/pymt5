@@ -545,9 +545,15 @@ class SyncMT5Client:
         volume_lots: float | None = None,
         fill_timeout: float = 30.0,
         filling: int | None = None,
+        symbol: str | None = None,
+        side: str | None = None,
         timeout: float | None = None,
     ) -> int:
-        """Close an open position by ticket; return the closing deal ticket."""
+        """Close an open position by ticket; return the closing deal ticket.
+
+        ``symbol``/``side``/``volume_lots`` skip the book poll entirely;
+        ``side`` is the position side. See the async API.
+        """
         return self._call(
             self._client.close_position_by_ticket(
                 ticket,
@@ -556,6 +562,8 @@ class SyncMT5Client:
                 volume_lots=volume_lots,
                 fill_timeout=fill_timeout,
                 filling=filling,
+                symbol=symbol,
+                side=side,
             ),
             timeout,
         )

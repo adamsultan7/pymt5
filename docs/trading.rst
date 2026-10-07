@@ -122,6 +122,16 @@ Closing is idempotent, so bots should purge local state instead of retrying:
    except MT5TimeoutError:
        reconcile_with_positions_get()  # ambiguous: verify before any resend
 
+Closes are sent unconditionally, like the reference client: a position
+missing from the book poll is never proof of closure (push-vs-snapshot lag
+provably misfires on sub-second-old live positions), so there is no local
+gate — only the server verdict decides, and genuine already-closed comes
+back as ``PositionAlreadyClosedError`` from that verdict. Pass
+``symbol``/``side``/``volume_lots`` explicitly to skip the poll entirely
+(``side`` is the position side); without a book row and without full
+explicit routing the close cannot be built and raises generic ``TradeError``
+(unknown position — explicitly *not* already-closed) without sending.
+
 .. note::
    Migration: the ``fill_timeout`` default changed from 10.0 to 30.0. Callers
    that relied on a fast ``MT5TimeoutError`` should pass an explicit short
@@ -153,7 +163,8 @@ Each retry waits ``requote_delay`` seconds (default: the symbol's
 ``trade.lf`` field, else 7.0s), refreshes the order price from the requote
 payload quotes, and resends — all inside the same overall ``fill_timeout``
 budget, so set the budget above ``requote_delay * (retries + 1)``. Pending
-orders and position closes never auto-retry.
+orders and position closes never auto-retry on requote; closes and market
+orders do retry once on 10030 with the alternate fill mode (see above).
 
 Low-Level Trade Request
 -----------------------

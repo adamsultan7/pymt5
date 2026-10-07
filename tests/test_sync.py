@@ -250,7 +250,27 @@ def test_sync_close_forwards_filling():
         inst.close_position_by_ticket = AsyncMock(return_value=666)
         assert sync.close_position_by_ticket(555, filling=1) == 666
         inst.close_position_by_ticket.assert_awaited_once_with(
-            555, deviation=20, comment="", volume_lots=None, fill_timeout=30.0, filling=1
+            555, deviation=20, comment="", volume_lots=None, fill_timeout=30.0, filling=1, symbol=None, side=None
+        )
+    finally:
+        sync.close()
+
+
+def test_sync_close_forwards_explicit_routing():
+    """Item 3: symbol/side reach the async close for stale-book sends."""
+    sync, inst = _make_sync()
+    try:
+        inst.close_position_by_ticket = AsyncMock(return_value=666)
+        assert sync.close_position_by_ticket(555, symbol="EURUSD", side="buy", volume_lots=0.01) == 666
+        inst.close_position_by_ticket.assert_awaited_once_with(
+            555,
+            deviation=20,
+            comment="",
+            volume_lots=0.01,
+            fill_timeout=30.0,
+            filling=None,
+            symbol="EURUSD",
+            side="buy",
         )
     finally:
         sync.close()
