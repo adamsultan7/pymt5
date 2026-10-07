@@ -621,3 +621,101 @@ async def test_close_position_by_ticket_accepts_explicit_filling():
     c2 = _client()
     await c2.close_position_by_ticket(777)
     assert c2.trade_request.call_args.kwargs["type_filling"] == ORDER_FILLING_FOK  # INFO mode 1
+
+
+# ---- Item 2: verdict-first fill resolution (kills the echo bug) ----
+
+
+async def test_invalid_fill_push_fallback_retries_once_flipped():
+    """10030 push reject-echo (with the position id echoed) also flips."""
+    from pymt5.constants import TRADE_RETCODE_INVALID_FILL
+
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(
+            side_effect=[
+                {"trade_order": 0, "trade_position": 397698437, "retcode": TRADE_RETCODE_INVALID_FILL},
+                {"trade_order": 0, "trade_position": 397698999, "retcode": 10009},
+            ]
+        ),
+    )
+    ticket = await c.place_market("EURUSD", "buy", 0.01)
+    assert ticket == 397698999
+    assert c.trade_request.await_count == 2
+    first, second = c.trade_request.call_args_list
+    assert first.kwargs["type_filling"] == ORDER_FILLING_FOK
+    assert second.kwargs["type_filling"] == ORDER_FILLING_IOC
+
+
+async def test_error_push_with_echoed_tickets_raises_not_returns():
+    """Verdict first: error code wins over echo fields AND ack tickets."""
+    from pymt5.constants import TRADE_RETCODE_INVALID_FILL
+
+    c = _client()
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future = loop.create_future()
+    waiter.set_result({"trade_order": 0, "trade_position": 397698437, "retcode": TRADE_RETCODE_INVALID_FILL})
+    with pytest.raises(TradeError) as exc_info:
+        await c._resolve_fill(
+            waiter=waiter,
+            result=_ok(deal=999, order=888),  # ack echo must not confirm
+            symbol="EURUSD",
+            trade_action=1,
+        )
+    assert exc_info.value.retcode == TRADE_RETCODE_INVALID_FILL
+
+
+async def test_error_push_echo_end_to_end_raises_trade_error():
+    """Live shape: 10030 reject echoing the request position id, twice."""
+    from pymt5.constants import TRADE_RETCODE_INVALID_FILL
+
+    echo = {"trade_order": 0, "trade_position": 397698437, "retcode": TRADE_RETCODE_INVALID_FILL}
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(side_effect=[dict(echo), dict(echo)]),
+    )
+    with pytest.raises(TradeError) as exc_info:
+        await c.place_market("EURUSD", "buy", 0.01)
+    assert exc_info.value.retcode == TRADE_RETCODE_INVALID_FILL
+    assert c.trade_request.await_count == 2  # one alternate-mode retry, then fail closed
+
+
+async def test_success_push_resolves_via_position_ticket():
+    """10009 + trade_position resolves (the live open-confirm shape)."""
+    c = _client()
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future = loop.create_future()
+    waiter.set_result({"trade_order": 0, "trade_position": 397698437, "retcode": 10009})
+    ticket = await c._resolve_fill(waiter=waiter, result=_ok(deal=0, order=0), symbol="EURUSD", trade_action=1)
+    assert ticket == 397698437
+
+
+async def test_success_push_without_ticket_is_timeout_not_echo():
+    """Success verdict but no ticket: ack echo is not proof — reconcile."""
+    c = _client()
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future = loop.create_future()
+    waiter.set_result({"trade_order": 0, "trade_position": 0, "retcode": 10009})
+    with pytest.raises(MT5TimeoutError):
+        await c._resolve_fill(waiter=waiter, result=_ok(deal=999, order=888), symbol="EURUSD", trade_action=1)
+
+
+async def test_pending_success_push_resolves_order_ticket():
+    """Pending placement confirms via 10008 + trade_order, not ack .order."""
+    c = _client(
+        trade_request=AsyncMock(return_value=_ok(deal=0, order=0)),
+        wait_for_trade_result=AsyncMock(return_value={"trade_order": 123456, "trade_position": 0, "retcode": 10008}),
+    )
+    ticket = await c._place_with_fill(
+        symbol="EURUSD",
+        trade_action=TRADE_ACTION_PENDING,
+        volume_proto=1000000,
+        digits=5,
+        filling=0,
+        trade_type=ORDER_TYPE_BUY_LIMIT,
+        price_order=1.08,
+        requote_retries=0,
+        requote_delay=0.01,
+        fill_timeout=5.0,
+    )
+    assert ticket == 123456

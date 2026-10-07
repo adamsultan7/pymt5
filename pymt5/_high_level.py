@@ -255,14 +255,21 @@ class _HighLevelMixin:
     ) -> int:
         """Resolve the ticket for a successful trade request.
 
-        Prefers the cmd-19 push (what the web UI renders: ``trade_position``,
-        else ``trade_order``). A push that arrives with zero tickets is proof
-        of non-execution: with an explicit final code it raises
-        :class:`TradeError` (or signals a requote retry for 10004), and with
-        no usable code it raises ``TradeError(retcode=0)`` — never
-        :class:`MT5TimeoutError`, which is reserved for a genuinely missing
-        push. Falls back to the cmd-12 response tickets only when no push
-        arrived at all. Never resends.
+        Verdict first, tickets second: the push ``retcode`` is evaluated
+        BEFORE any ticket field. A final error code raises
+        :class:`TradeError` even when the push echoes nonzero tickets (the
+        10030 reject echo carries the requested position id, not a deal);
+        only final-success codes (10008/10009/10010) may resolve via
+        ``trade_position``/``trade_order``. Requote (10004) signals a retry
+        via :class:`_PushRequote`. A push with no usable code keeps the
+        legacy rule (ticket means executed, else ``TradeError(retcode=0)``).
+
+        The cmd-12 ack echo (``result.deal``/``result.order``) is used only
+        when no push verdict arrived at all AND the ack explicitly succeeded
+        — it is a legacy best-effort fallback, never confirmation. A success
+        verdict with no ticket, or no push and no ack tickets, raises
+        :class:`MT5TimeoutError` (genuinely ambiguous: reconcile with
+        ``positions_get()``). Never resends.
         """
         try:
             push = await waiter
@@ -270,21 +277,36 @@ class _HighLevelMixin:
             logger.debug("fill wait failed: %s", exc)
             push = None
         if push:
-            ticket = _push_ticket(push)
-            if ticket:
-                return ticket
             code = _push_code(push)
-            if code is None or code not in _NON_FINAL_RESULT_CODES:
-                if code == TRADE_RETCODE_REQUOTE:
-                    raise _PushRequote(bid=_push_float(push, "bid"), ask=_push_float(push, "ask"))
-                if code is None:
-                    raise TradeError(
-                        "server answered without executing "
-                        f"(no ticket, no reason code): {symbol} action={trade_action}",
-                        retcode=0,
-                        symbol=symbol,
-                        action=trade_action,
-                    )
+            if code is None:
+                ticket = _push_ticket(push)
+                if ticket:
+                    return ticket
+                raise TradeError(
+                    f"server answered without executing (no ticket, no reason code): {symbol} action={trade_action}",
+                    retcode=0,
+                    symbol=symbol,
+                    action=trade_action,
+                )
+            if code in _NON_FINAL_RESULT_CODES:
+                # The waiter filters these; a direct call may still see one.
+                # No verdict — treat as no push below.
+                push = None
+            elif code == TRADE_RETCODE_REQUOTE:
+                raise _PushRequote(bid=_push_float(push, "bid"), ask=_push_float(push, "ask"))
+            elif code in _FINAL_SUCCESS_CODES:
+                ticket = _push_ticket(push)
+                if ticket:
+                    return ticket
+                # Success verdict but no ticket: the ack echo is not
+                # execution proof, so there is nothing trustworthy to
+                # return — reconcile instead of confirming.
+                raise MT5TimeoutError(
+                    f"fill confirmation timed out for {symbol} action={trade_action}; "
+                    "the server reported success but no ticket — reconcile with positions_get() "
+                    "(no resend was attempted)"
+                )
+            else:
                 desc = push.get("description") or push.get("comment") or TRADE_RETCODE_DESCRIPTIONS.get(code, "")
                 if closing and code == TRADE_RETCODE_POSITION_CLOSED:
                     raise PositionAlreadyClosedError(
@@ -299,10 +321,11 @@ class _HighLevelMixin:
                     symbol=symbol,
                     action=trade_action,
                 )
-        if result.deal:
-            return int(result.deal)
-        if result.order:
-            return int(result.order)
+        if push is None and result.success:
+            if result.deal:
+                return int(result.deal)
+            if result.order:
+                return int(result.order)
         raise MT5TimeoutError(
             f"fill confirmation timed out for {symbol} action={trade_action}; "
             "the request may have executed — reconcile with positions_get() "

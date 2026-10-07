@@ -93,6 +93,17 @@ required. Downstream code that catches ``MT5TimeoutError`` to reconcile
 should also catch ``TradeError`` for the immediate-reject case, where a
 reprice/retry is safe without reconciliation.
 
+Verdict-first resolution: the push ``retcode`` is evaluated before any
+ticket field, and only success codes (10008 placed / 10009 done / 10010
+partial) may resolve a ticket. A reject push that echoes nonzero tickets —
+live: 10030 echoing the requested ``position_id`` with ``trade_order=0`` —
+raises ``TradeError`` instead of returning the echo as a false "deal".
+Likewise the cmd-12 ack echo (``result.deal``/``result.order``) only fills
+in when no push verdict arrived at all and the ack explicitly succeeded;
+it is never confirmation. Migration: closes/opens that previously
+"succeeded" via echo now correctly raise — consumers must handle
+``TradeError`` on every ticket call.
+
 Closing an already-closed position raises
 :class:`~pymt5.PositionAlreadyClosedError`, a subclass of ``TradeError``.
 Closing is idempotent, so bots should purge local state instead of retrying:
