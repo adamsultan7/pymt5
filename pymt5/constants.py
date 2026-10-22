@@ -148,6 +148,12 @@ TRADE_ACTION_MODIFY = 7  # Modify a pending order
 TRADE_ACTION_REMOVE = 8  # Remove a pending order
 TRADE_ACTION_CLOSE_BY = 10  # Close by opposite position
 
+# ---- MT5 Order Comment ----
+# The order comment is capped by the terminal (31 characters); the
+# remainder of the comment is ours to use (the system name + the
+# conviction).
+TRADE_COMMENT_MAX = 31
+
 # ---- MT5 Order Types ----
 ORDER_TYPE_BUY = 0
 ORDER_TYPE_SELL = 1
