@@ -100,6 +100,26 @@ def _strip_nul(value: Any) -> Any:
     return value.rstrip("\x00") if isinstance(value, str) else value
 
 
+def _mark_closed(records: RecordList, volume_key: str) -> RecordList:
+    """Mark the trades the server reports as CLOSED.
+
+    The cmd=4 push is a DELTA: it carries the trades that changed, and a
+    trade that is GONE arrives with a zero volume. The official Web
+    Terminal removes it from its book on exactly that rule (its
+    updatePosition: a record with no volume removes the trade).
+
+    Expose the rule instead of making every caller re-derive it - a
+    closed trade kept in the book blocks the next entry on that pair.
+    """
+    for rec in records or []:
+        try:
+            if float(rec.get(volume_key, 0) or 0) <= 0:
+                rec["closed"] = True
+        except (TypeError, ValueError):
+            continue
+    return records
+
+
 class _PushHandlersMixin:
     """Mixin providing push event handler registration for MT5WebClient."""
 
@@ -144,7 +164,7 @@ class _PushHandlersMixin:
             try:
                 body = result.body
                 positions = _parse_counted_records(body, POSITION_SCHEMA, POSITION_FIELD_NAMES)
-                callback(positions)
+                callback(_mark_closed(positions, "trade_volume"))
             except _PARSE_ERRORS as exc:
                 logger.error("position update parse error: %s", exc)
 
@@ -165,7 +185,7 @@ class _PushHandlersMixin:
                 pos_count = struct.unpack_from("<I", body, 0)[0] if body else 0
                 order_offset = 4 + pos_count * pos_size
                 orders = _parse_counted_records(body[order_offset:], ORDER_SCHEMA, ORDER_FIELD_NAMES)
-                callback(orders)
+                callback(_mark_closed(orders, "volume_current"))
             except _PARSE_ERRORS as exc:
                 logger.error("order update parse error: %s", exc)
 
@@ -189,7 +209,8 @@ class _PushHandlersMixin:
                 pos_count = struct.unpack_from("<I", body, 0)[0] if body else 0
                 order_offset = 4 + pos_count * pos_size
                 orders = _parse_counted_records(body[order_offset:], ORDER_SCHEMA, ORDER_FIELD_NAMES)
-                callback({"positions": positions, "orders": orders})
+                callback({"positions": _mark_closed(positions, "trade_volume"),
+                      "orders": _mark_closed(orders, "volume_current")})
             except _PARSE_ERRORS as exc:
                 logger.error("trade update parse error: %s", exc)
 

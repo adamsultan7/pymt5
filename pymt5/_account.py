@@ -6,6 +6,8 @@ account opening, OTP setup, notifications, and corporate links.
 
 from __future__ import annotations
 
+import time
+
 import struct
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -119,6 +121,26 @@ class _AccountMixin:
     async def account_info(self) -> Record:
         """Official-style alias for get_account()."""
         return await self.get_account()
+
+    async def server_shift(self) -> float:
+        """Broker clock offset (server wall - true UTC) in seconds.
+
+        Web ticks carry the SERVER wall time as an epoch, so freshness has
+        to be measured against the server clock - a UTC box would read
+        every tick as hours stale. Cached for an hour.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_server_shift_cache", None)
+        if cached and now - cached[0] < 3600:
+            return cached[1]
+        shift = 0.0
+        try:
+            acct = await self.get_account()
+            shift = float(acct.get("timezone_shift", 0) or 0)
+        except Exception:
+            shift = 0.0
+        self._server_shift_cache = (now, shift)
+        return shift
 
     async def terminal_info(self) -> Record:
         """Best-effort terminal/server info derived from the Web account config."""

@@ -375,6 +375,10 @@ class SyncMT5Client:
     def account_info(self, timeout: float | None = None) -> Record:
         return self._call(self._client.account_info(), timeout)
 
+    def server_shift(self, timeout: float | None = None) -> float:
+        """Broker clock offset (server wall - true UTC) in seconds."""
+        return self._call(self._client.server_shift(), timeout)
+
     def get_account_summary(self, timeout: float | None = None) -> AccountInfo:
         return self._call(self._client.get_account_summary(), timeout)
 
