@@ -126,6 +126,32 @@ class _TradingMixin:
         def _volume_to_lots(volume: float, precision: int = 8) -> int: ...
 
     async def get_positions_and_orders(self) -> dict[str, RecordList]:
+        """The SESSION's opened book (cmd=4).
+
+        This is a request/response read of the server-side trade context
+        this websocket built when it logged in - it is NOT a push and it
+        does not follow the account:
+
+        * a session that logged in while the account was flat keeps
+          reading an empty book after another session (or the web
+          terminal) opens a position - and even after it opens one
+          itself (measured 2026-10-22: empty for the whole session while
+          two positions were live), and
+        * a session that had a position in its book keeps listing it
+          after another session closes it (seen after every manual close
+          - for hours on a long-lived session).
+
+        A fresh login rebuilds the context from the account, which is why
+        the official Web Terminal is always right after a page reload: a
+        page reload IS a new login (captured: BOOTSTRAP, then cmd=28 with
+        the previous session id, then one cmd=4). Live trade changes come
+        on the cmd=10 push instead (see ``on_trade_update``); this read is
+        only the book a new session starts from.
+
+        So: treat this as the SNAPSHOT of the session, not as the truth.
+        Callers that need the account's truth when their session has been
+        up for a while must log in again (what a browser refresh does).
+        """
         result = await self.transport.send_command(CMD_GET_POSITIONS_ORDERS)
         body = result.body
         positions = _parse_counted_records(body, POSITION_SCHEMA, POSITION_FIELD_NAMES)
@@ -136,6 +162,17 @@ class _TradingMixin:
         return {"positions": positions, "orders": orders}
 
     async def get_trade_history(self, from_ts: int = 0, to_ts: int = 0) -> dict[str, RecordList]:
+        """Closed deals and history orders (cmd=5).
+
+        This is a request/response read, not a stream: the official Web
+        Terminal calls it ONCE at login and never again on its own -
+        captured 2026-10-22: one cmd=5 after cmd=4, none when the History
+        tab was opened or re-opened, and none after a trade was closed
+        from another session (the close only appeared after a page
+        reload). So a caller that needs a close recorded in realtime must
+        use the cmd=10 push (``on_trade_update`` returns its ``deals``),
+        not this read.
+        """
         payload = struct.pack("<ii", from_ts, to_ts)
         result = await self.transport.send_command(CMD_GET_TRADE_HISTORY, payload)
         body = result.body
