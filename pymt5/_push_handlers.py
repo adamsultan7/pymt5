@@ -12,11 +12,10 @@ from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from pymt5._parsers import _parse_account_response, _parse_book_entries, _parse_counted_records, _parse_tick_batch
+from pymt5._parsers import _parse_account_response, _parse_book_entries, _parse_tick_batch
 from pymt5.constants import (
     CMD_ACCOUNT_UPDATE_PUSH,
     CMD_BOOK_PUSH,
-    CMD_GET_POSITIONS_ORDERS,
     CMD_LOGIN_STATUS_PUSH,
     CMD_SYMBOL_DETAILS_PUSH,
     CMD_SYMBOL_UPDATE_PUSH,
@@ -40,8 +39,6 @@ from pymt5.schemas import (
     TRADE_RESULT_PUSH_SCHEMA,
     TRADE_RESULT_RESPONSE_FIELD_NAMES,
     TRADE_RESULT_RESPONSE_SCHEMA,
-    TRADE_TRANSACTION_FIELD_NAMES,
-    TRADE_TRANSACTION_SCHEMA,
     TRADE_UPDATE_BALANCE_FIELD_NAMES,
     TRADE_UPDATE_BALANCE_SCHEMA,
 )
@@ -100,24 +97,101 @@ def _strip_nul(value: Any) -> Any:
     return value.rstrip("\x00") if isinstance(value, str) else value
 
 
-def _mark_closed(records: RecordList, volume_key: str) -> RecordList:
-    """Mark the trades the server reports as CLOSED.
+# ---------------------------------------------------------------------------
+# cmd=10 (trade update push) - the live trade channel
+# ---------------------------------------------------------------------------
+#: Every cmd=10 entry starts with this header.
+_TRADE_ENTRY_HEADER_SIZE = 12
+_ORDER_RECORD_SIZE = get_series_size(ORDER_SCHEMA)
+_DEAL_RECORD_SIZE = get_series_size(DEAL_SCHEMA)
+_POSITION_RECORD_SIZE = get_series_size(POSITION_SCHEMA)
+_BALANCE_RECORD_SIZE = get_series_size(TRADE_UPDATE_BALANCE_SCHEMA)
 
-    The cmd=4 push is a DELTA: it carries the trades that changed, and a
-    trade that is GONE arrives with a zero volume. The official Web
-    Terminal removes it from its book on exactly that rule (its
-    updatePosition: a record with no volume removes the trade).
 
-    Expose the rule instead of making every caller re-derive it - a
-    closed trade kept in the book blocks the next entry on that pair.
+def parse_trade_update_push(body: bytes) -> list[dict[str, Any]]:
+    """Parse a cmd=10 trade-update push into its entries.
+
+    The frame is a sequence of entries; each entry is a 12-byte header
+    followed by a payload selected by the header's type:
+
+    * type 0 / 1 - an ORDER record (the order was created / filled / gone),
+    * type 2     - a DEAL, the resulting POSITION and the balance block.
+
+    This is the channel the official Web Terminal uses to keep its book in
+    sync: the trade disappears from the terminal the moment it happens,
+    because the server pushes the new position state (a closed position
+    arrives with volume 0).
+
+    A record whose volume is 0 is GONE - it carries ``closed: True``.
     """
-    for rec in records or []:
-        try:
-            if float(rec.get(volume_key, 0) or 0) <= 0:
-                rec["closed"] = True
-        except (TypeError, ValueError):
-            continue
-    return records
+    entries: list[dict[str, Any]] = []
+    offset = 0
+    total = len(body or b"")
+    while offset + _TRADE_ENTRY_HEADER_SIZE <= total:
+        entry_type, serial, action = struct.unpack_from(
+            "<III", body, offset
+        )
+        offset += _TRADE_ENTRY_HEADER_SIZE
+        entry: dict[str, Any] = {"entry_type": entry_type, "serial": serial,
+                                 "action": action}
+        if entry_type in (0, 1):
+            if offset + _ORDER_RECORD_SIZE > total:
+                break
+            values = SeriesCodec.parse_at(body, ORDER_SCHEMA, offset)
+            order = dict(zip(ORDER_FIELD_NAMES, values))
+            order["closed"] = float(order.get("volume_current") or 0) <= 0
+            entry["order"] = order
+            offset += _ORDER_RECORD_SIZE
+        elif entry_type == 2:
+            if offset + _DEAL_RECORD_SIZE > total:
+                break
+            values = SeriesCodec.parse_at(body, DEAL_SCHEMA, offset)
+            entry["deal"] = dict(zip(DEAL_FIELD_NAMES, values))
+            offset += _DEAL_RECORD_SIZE
+            if offset + _POSITION_RECORD_SIZE > total:
+                break
+            values = SeriesCodec.parse_at(body, POSITION_SCHEMA, offset)
+            position = dict(zip(POSITION_FIELD_NAMES, values))
+            position["closed"] = float(position.get("trade_volume") or 0) <= 0
+            entry["position"] = position
+            offset += _POSITION_RECORD_SIZE
+            if offset + _BALANCE_RECORD_SIZE <= total:
+                values = SeriesCodec.parse_at(
+                    body, TRADE_UPDATE_BALANCE_SCHEMA, offset
+                )
+                entry["balance"] = dict(
+                    zip(TRADE_UPDATE_BALANCE_FIELD_NAMES, values)
+                )
+                offset += _BALANCE_RECORD_SIZE
+        else:
+            # Unknown entry type: the layout is not the one this build
+            # speaks, so stop instead of decoding garbage.
+            break
+        entries.append(entry)
+    return entries
+
+
+def trade_update_payload(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Flatten parsed cmd=10 entries into positions / orders / deals.
+
+    The shape matches what a caller of the Web Terminal's book expects:
+    the current state of every trade that changed, with ``closed`` set on
+    the ones that are gone.
+    """
+    positions: list[dict[str, Any]] = []
+    orders: list[dict[str, Any]] = []
+    deals: list[dict[str, Any]] = []
+    for entry in entries or []:
+        position = entry.get("position")
+        if position is not None:
+            positions.append(position)
+        order = entry.get("order")
+        if order is not None:
+            orders.append(order)
+        deal = entry.get("deal")
+        if deal is not None:
+            deals.append(deal)
+    return {"positions": positions, "orders": orders, "deals": deals}
 
 
 class _PushHandlersMixin:
@@ -156,65 +230,66 @@ class _PushHandlersMixin:
     def on_position_update(self, callback: Callable[[RecordList], None]) -> Callable:
         """Register callback for position change push notifications.
 
-        The server pushes cmd=4 data when positions or orders change.
-        Returns the internal handler for use with transport.off().
+        The server pushes cmd=10 trade updates when a position changes:
+        it opens, it moves, or it closes (a closed position arrives with
+        volume 0 and is flagged ``closed``). Returns the internal handler
+        for use with transport.off().
         """
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                positions = _parse_counted_records(body, POSITION_SCHEMA, POSITION_FIELD_NAMES)
-                callback(_mark_closed(positions, "trade_volume"))
+                entries = parse_trade_update_push(result.body)
+                positions = [e["position"] for e in entries if "position" in e]
+                if positions:
+                    callback(positions)
             except _PARSE_ERRORS as exc:
                 logger.error("position update parse error: %s", exc)
 
-        self.transport.on(CMD_GET_POSITIONS_ORDERS, _handler)
+        self.transport.on(CMD_TRADE_UPDATE_PUSH, _handler)
         return _handler
 
     def on_order_update(self, callback: Callable[[RecordList], None]) -> Callable:
-        """Register callback for order change push notifications.
+        """Register callback for pending order change push notifications.
 
-        Parses orders from the same cmd=4 push.
+        The orders ride on the same cmd=10 trade update push (the order
+        was placed, filled or canceled - a finished order arrives with
+        volume 0 and is flagged ``closed``).
         Returns the internal handler for use with transport.off().
         """
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                pos_size = get_series_size(POSITION_SCHEMA)
-                pos_count = struct.unpack_from("<I", body, 0)[0] if body else 0
-                order_offset = 4 + pos_count * pos_size
-                orders = _parse_counted_records(body[order_offset:], ORDER_SCHEMA, ORDER_FIELD_NAMES)
-                callback(_mark_closed(orders, "volume_current"))
+                entries = parse_trade_update_push(result.body)
+                orders = [e["order"] for e in entries if "order" in e]
+                if orders:
+                    callback(orders)
             except _PARSE_ERRORS as exc:
                 logger.error("order update parse error: %s", exc)
 
-        self.transport.on(CMD_GET_POSITIONS_ORDERS, _handler)
+        self.transport.on(CMD_TRADE_UPDATE_PUSH, _handler)
         return _handler
 
     def on_trade_update(self, callback: Callable[[dict[str, RecordList]], None]) -> Callable:
         """Register callback for combined position+order push notifications.
 
-        Parses both positions and orders from cmd=4 push into a single dict
-        with keys 'positions' and 'orders'. More efficient than registering
-        separate on_position_update and on_order_update handlers.
+        Parses the cmd=10 trade update push into a single dict with keys
+        'positions', 'orders' and 'deals'. This is the live trade channel:
+        the server pushes it for EVERY trade change on the account (also
+        the ones made in another session - the official Web Terminal shows
+        a closed position the moment it closes for exactly this reason).
+        More efficient than registering separate on_position_update and
+        on_order_update handlers.
         Returns the internal handler for use with transport.off().
         """
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                positions = _parse_counted_records(body, POSITION_SCHEMA, POSITION_FIELD_NAMES)
-                pos_size = get_series_size(POSITION_SCHEMA)
-                pos_count = struct.unpack_from("<I", body, 0)[0] if body else 0
-                order_offset = 4 + pos_count * pos_size
-                orders = _parse_counted_records(body[order_offset:], ORDER_SCHEMA, ORDER_FIELD_NAMES)
-                callback({"positions": _mark_closed(positions, "trade_volume"),
-                      "orders": _mark_closed(orders, "volume_current")})
+                entries = parse_trade_update_push(result.body)
+                callback(trade_update_payload(entries))
             except _PARSE_ERRORS as exc:
                 logger.error("trade update parse error: %s", exc)
 
-        self.transport.on(CMD_GET_POSITIONS_ORDERS, _handler)
+        self.transport.on(CMD_TRADE_UPDATE_PUSH, _handler)
         return _handler
 
     def on_symbol_update(self, callback: Callable[[CommandResult], None]) -> Callable:
@@ -364,50 +439,24 @@ class _PushHandlersMixin:
         return outcome[0] if outcome else None
 
     def on_trade_transaction(self, callback: Callable[[Record], None]) -> Callable:
-        """Register callback for trade update push (cmd=10).
+        """Register callback for the raw trade update push (cmd=10).
 
-        Receives real-time trade state changes:
-        - type=2: Balance update with deals and positions arrays
-        - type!=2: Order transaction (add/update/delete)
+        The push is a sequence of entries; each entry carries the trade
+        that changed:
 
-        Callback receives a dict with:
-        - 'update_type': 2 for balance update, other for transaction
-        - For balance updates: 'balance_info', 'deals', 'positions'
-        - For transactions: 'flag_mask', 'transaction_id', 'transaction_type', 'order'
+        - entry_type 0 / 1: an order event - 'order' holds the order
+          record (volume 0 means the order is gone),
+        - entry_type 2: a deal - 'deal' holds the deal record, 'position'
+          the resulting position state (volume 0 means the position is
+          CLOSED) and 'balance' the account balance block.
+
+        The callback receives one dict per entry.
         """
 
         def _handler(result: CommandResult) -> None:
             try:
-                body = result.body
-                if len(body) < 4:
-                    return
-                update_type = struct.unpack_from("<I", body, 0)[0]
-                data: dict[str, Any] = {"update_type": update_type}
-                if update_type == 2:
-                    offset = 4
-                    balance_size = get_series_size(TRADE_UPDATE_BALANCE_SCHEMA)
-                    if len(body) >= offset + balance_size:
-                        vals = SeriesCodec.parse_at(body, TRADE_UPDATE_BALANCE_SCHEMA, offset)
-                        data["balance_info"] = dict(zip(TRADE_UPDATE_BALANCE_FIELD_NAMES, vals))
-                        offset += balance_size
-                    data["deals"] = _parse_counted_records(body[offset:], DEAL_SCHEMA, DEAL_FIELD_NAMES)
-                    deal_size = get_series_size(DEAL_SCHEMA)
-                    if len(body) > offset and len(body[offset:]) >= 4:
-                        deal_count = struct.unpack_from("<I", body, offset)[0]
-                        offset += 4 + deal_count * deal_size
-                    data["positions"] = _parse_counted_records(body[offset:], POSITION_SCHEMA, POSITION_FIELD_NAMES)
-                else:
-                    offset = 4
-                    txn_size = get_series_size(TRADE_TRANSACTION_SCHEMA)
-                    if len(body) >= offset + txn_size:
-                        vals = SeriesCodec.parse_at(body, TRADE_TRANSACTION_SCHEMA, offset)
-                        data.update(zip(TRADE_TRANSACTION_FIELD_NAMES, vals))
-                        offset += txn_size
-                    order_size = get_series_size(ORDER_SCHEMA)
-                    if len(body) >= offset + order_size:
-                        order_vals = SeriesCodec.parse_at(body, ORDER_SCHEMA, offset)
-                        data["order"] = dict(zip(ORDER_FIELD_NAMES, order_vals))
-                callback(data)
+                for entry in parse_trade_update_push(result.body):
+                    callback(entry)
             except _PARSE_ERRORS as exc:
                 logger.error("trade transaction push parse error: %s", exc)
 

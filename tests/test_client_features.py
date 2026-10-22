@@ -24,7 +24,6 @@ from pymt5.constants import (
     CMD_BOOK_PUSH,
     CMD_GET_ACCOUNT,
     CMD_GET_CORPORATE_LINKS,
-    CMD_GET_POSITIONS_ORDERS,
     CMD_GET_SYMBOL_GROUPS,
     CMD_SUBSCRIBE_BOOK,
     CMD_SYMBOL_DETAILS_PUSH,
@@ -90,10 +89,10 @@ from pymt5.schemas import (
     TRADE_RESULT_PUSH_SCHEMA,
     TRADE_RESULT_RESPONSE_FIELD_NAMES,
     TRADE_RESULT_RESPONSE_SCHEMA,
-    TRADE_TRANSACTION_FIELD_NAMES,
-    TRADE_TRANSACTION_SCHEMA,
     TRADE_UPDATE_BALANCE_FIELD_NAMES,
     TRADE_UPDATE_BALANCE_SCHEMA,
+    TRADE_UPDATE_ENTRY_FIELD_NAMES,
+    TRADE_UPDATE_ENTRY_SCHEMA,
 )
 from pymt5.transport import CommandResult
 
@@ -753,11 +752,15 @@ def test_detect_close_direction_defaults_to_sell():
 
 
 def test_on_trade_update_handler_registration():
+    from pymt5.constants import CMD_TRADE_UPDATE_PUSH
+
     client = MT5WebClient()
     called = []
     client.on_trade_update(lambda data: called.append(data))
-    assert CMD_GET_POSITIONS_ORDERS in client.transport._listeners
-    assert len(client.transport._listeners[CMD_GET_POSITIONS_ORDERS]) == 1
+    # The live trade channel: the server pushes cmd=10 for every trade
+    # change (cmd=4 is a request/response poll, not a push).
+    assert CMD_TRADE_UPDATE_PUSH in client.transport._listeners
+    assert len(client.transport._listeners[CMD_TRADE_UPDATE_PUSH]) == 1
 
 
 def test_on_symbol_update_handler_registration():
@@ -921,11 +924,12 @@ def test_trade_result_response_schema():
     assert "ask" in TRADE_RESULT_RESPONSE_FIELD_NAMES
 
 
-def test_trade_transaction_schema():
-    assert len(TRADE_TRANSACTION_SCHEMA) == 3
-    assert len(TRADE_TRANSACTION_FIELD_NAMES) == 3
-    assert "flag_mask" in TRADE_TRANSACTION_FIELD_NAMES
-    assert "transaction_type" in TRADE_TRANSACTION_FIELD_NAMES
+def test_trade_update_entry_schema():
+    assert len(TRADE_UPDATE_ENTRY_SCHEMA) == 3
+    assert len(TRADE_UPDATE_ENTRY_FIELD_NAMES) == 3
+    assert "entry_type" in TRADE_UPDATE_ENTRY_FIELD_NAMES
+    assert "serial" in TRADE_UPDATE_ENTRY_FIELD_NAMES
+    assert "action" in TRADE_UPDATE_ENTRY_FIELD_NAMES
 
 
 def test_trade_update_balance_schema():
@@ -1023,13 +1027,13 @@ def test_trade_update_balance_roundtrip():
     assert d["margin_free"] == 10550.0
 
 
-def test_trade_transaction_roundtrip():
+def test_trade_update_entry_roundtrip():
     body = struct.pack("<III", 2, 99, 0)
-    vals = SeriesCodec.parse(body, TRADE_TRANSACTION_SCHEMA)
-    d = dict(zip(TRADE_TRANSACTION_FIELD_NAMES, vals))
-    assert d["flag_mask"] == 2
-    assert d["transaction_id"] == 99
-    assert d["transaction_type"] == 0  # add
+    vals = SeriesCodec.parse(body, TRADE_UPDATE_ENTRY_SCHEMA)
+    d = dict(zip(TRADE_UPDATE_ENTRY_FIELD_NAMES, vals))
+    assert d["entry_type"] == 2
+    assert d["serial"] == 99
+    assert d["action"] == 0
 
 
 # ---- subscribe_book_by_name validation ----

@@ -11,7 +11,6 @@ from pymt5._push_handlers import _PushHandlersMixin
 from pymt5.constants import (
     CMD_ACCOUNT_UPDATE_PUSH,
     CMD_BOOK_PUSH,
-    CMD_GET_POSITIONS_ORDERS,
     CMD_LOGIN_STATUS_PUSH,
     CMD_SYMBOL_DETAILS_PUSH,
     CMD_SYMBOL_UPDATE_PUSH,
@@ -27,11 +26,17 @@ from pymt5.constants import (
 from pymt5.protocol import SeriesCodec, get_series_size
 from pymt5.schemas import (
     ACCOUNT_WEB_MAIN_SCHEMA,
+    DEAL_FIELD_NAMES,
+    DEAL_SCHEMA,
+    ORDER_FIELD_NAMES,
     ORDER_SCHEMA,
+    POSITION_FIELD_NAMES,
     POSITION_SCHEMA,
     SYMBOL_DETAILS_SCHEMA,
     TRADE_RESULT_PUSH_SCHEMA,
     TRADE_RESULT_RESPONSE_SCHEMA,
+    TRADE_UPDATE_BALANCE_FIELD_NAMES,
+    TRADE_UPDATE_BALANCE_SCHEMA,
 )
 from pymt5.transport import CommandResult
 from pymt5.types import SymbolInfo
@@ -102,8 +107,39 @@ def _build_order_body(count: int = 1) -> bytes:
 
 
 def _build_positions_and_orders(pos_count: int = 1, order_count: int = 1) -> bytes:
-    """Build a combined positions+orders body as sent by cmd=4 pushes."""
+    """Build a combined positions+orders body as sent by cmd=4 poll responses."""
     return _build_position_body(pos_count) + _build_order_body(order_count)
+
+
+def _build_trade_update_body(
+    *,
+    orders=(),
+    deal=None,
+    position=None,
+    balance=None,
+) -> bytes:
+    """Build a cmd=10 trade-update push body (the live trade channel).
+
+    ``orders`` is a list of (entry_type, order_values) pairs; a deal +
+    position pair becomes one entry_type=2 entry.
+    """
+    body = b""
+    for entry_type, values in orders:
+        body += struct.pack("<III", entry_type, 1000 + entry_type, 0)
+        body += _serialize_fields(ORDER_SCHEMA, ORDER_FIELD_NAMES, values)
+    if deal is not None or position is not None:
+        body += struct.pack("<III", 2, 2000, 0)
+        if deal is not None:
+            body += _serialize_fields(DEAL_SCHEMA, DEAL_FIELD_NAMES, deal)
+        if position is not None:
+            body += _serialize_fields(POSITION_SCHEMA, POSITION_FIELD_NAMES, position)
+        body += _serialize_fields(
+            TRADE_UPDATE_BALANCE_SCHEMA, TRADE_UPDATE_BALANCE_FIELD_NAMES,
+            balance or {},
+        )
+    return body
+
+
 
 
 def _build_book_body(
@@ -532,43 +568,65 @@ class TestOnPositionUpdate:
 
         client.on_position_update(callback)
         client.transport.on.assert_called_once()
-        assert client.transport.on.call_args[0][0] == CMD_GET_POSITIONS_ORDERS
+        assert client.transport.on.call_args[0][0] == CMD_TRADE_UPDATE_PUSH
         handler = client.transport.on.call_args[0][1]
 
-        body = _build_position_body(count=2)
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=body)
+        body = _build_trade_update_body(
+            deal={"deal": 7, "trade_symbol": "EURUSD"},
+            position={"position_id": 42, "trade_symbol": "EURUSD",
+                      "trade_volume": 1000000},
+        )
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
         positions = callback.call_args[0][0]
-        assert len(positions) == 2
+        assert len(positions) == 1
+        assert positions[0]["position_id"] == 42
+        assert positions[0]["closed"] is False
 
-    def test_empty_body_returns_empty_list(self) -> None:
+    def test_a_closed_position_is_flagged(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
         client.on_position_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"")
-        handler(result)
+        body = _build_trade_update_body(
+            deal={"deal": 7, "trade_symbol": "EURUSD"},
+            position={"position_id": 42, "trade_symbol": "EURUSD",
+                      "trade_volume": 0},
+        )
+        handler(CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body))
 
-        callback.assert_called_once_with([])
+        positions = callback.call_args[0][0]
+        assert positions[0]["closed"] is True
 
-    def test_malformed_body_logs_error(self) -> None:
+    def test_empty_body_does_not_call_the_callback(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
         client.on_position_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        # count=1000 but not enough data for records => parse returns []
-        body = struct.pack("<I", 1000) + b"\x00" * 10
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=body)
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"")
         handler(result)
 
-        # _parse_counted_records handles short body by breaking out of loop
-        callback.assert_called_once_with([])
+        callback.assert_not_called()
+
+    def test_truncated_body_does_not_call_the_callback(self) -> None:
+        client = MockClient()
+        callback = MagicMock()
+
+        client.on_position_update(callback)
+        handler = client.transport.on.call_args[0][1]
+
+        # An entry header without its payload: nothing can be decoded.
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0,
+                               body=struct.pack("<III", 2, 5, 0))
+        handler(result)
+
+        callback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -583,28 +641,36 @@ class TestOnOrderUpdate:
 
         client.on_order_update(callback)
         client.transport.on.assert_called_once()
-        assert client.transport.on.call_args[0][0] == CMD_GET_POSITIONS_ORDERS
+        assert client.transport.on.call_args[0][0] == CMD_TRADE_UPDATE_PUSH
         handler = client.transport.on.call_args[0][1]
 
-        body = _build_positions_and_orders(pos_count=1, order_count=2)
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=body)
+        body = _build_trade_update_body(orders=[
+            (0, {"trade_order": 11, "trade_symbol": "EURUSD",
+                 "volume_current": 1000000}),
+            (1, {"trade_order": 12, "trade_symbol": "EURUSD",
+                 "volume_current": 0}),
+        ])
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
         orders = callback.call_args[0][0]
         assert len(orders) == 2
+        assert orders[0]["closed"] is False
+        # A finished order (volume 0) is GONE - the web terminal's rule.
+        assert orders[1]["closed"] is True
 
-    def test_empty_body_returns_empty_orders(self) -> None:
+    def test_empty_body_does_not_call_the_callback(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
         client.on_order_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"")
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"")
         handler(result)
 
-        callback.assert_called_once_with([])
+        callback.assert_not_called()
 
     def test_malformed_body_logs_error_no_callback(self) -> None:
         client = MockClient()
@@ -613,11 +679,10 @@ class TestOnOrderUpdate:
         client.on_order_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        # Very short body that will cause struct.unpack_from to fail
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"\x01")
+        # Too short for the entry header => nothing is decoded.
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"\x01")
         handler(result)
 
-        # Body is too short for struct.unpack_from("<I", body, 0) => struct.error
         callback.assert_not_called()
 
 
@@ -633,11 +698,17 @@ class TestOnTradeUpdate:
 
         client.on_trade_update(callback)
         client.transport.on.assert_called_once()
-        assert client.transport.on.call_args[0][0] == CMD_GET_POSITIONS_ORDERS
+        assert client.transport.on.call_args[0][0] == CMD_TRADE_UPDATE_PUSH
         handler = client.transport.on.call_args[0][1]
 
-        body = _build_positions_and_orders(pos_count=1, order_count=2)
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=body)
+        body = _build_trade_update_body(
+            orders=[(0, {"trade_order": 11, "trade_symbol": "EURUSD",
+                         "volume_current": 1000000})],
+            deal={"deal": 7, "trade_symbol": "EURUSD"},
+            position={"position_id": 42, "trade_symbol": "EURUSD",
+                      "trade_volume": 1000000},
+        )
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
@@ -645,7 +716,25 @@ class TestOnTradeUpdate:
         assert "positions" in data
         assert "orders" in data
         assert len(data["positions"]) == 1
-        assert len(data["orders"]) == 2
+        assert len(data["orders"]) == 1
+        assert len(data["deals"]) == 1
+
+    def test_a_closed_position_leaves_the_book(self) -> None:
+        client = MockClient()
+        callback = MagicMock()
+
+        client.on_trade_update(callback)
+        handler = client.transport.on.call_args[0][1]
+
+        body = _build_trade_update_body(
+            deal={"deal": 7, "trade_symbol": "EURUSD", "entry": 1},
+            position={"position_id": 42, "trade_symbol": "EURUSD",
+                      "trade_volume": 0},
+        )
+        handler(CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body))
+
+        data = callback.call_args[0][0]
+        assert data["positions"][0]["closed"] is True
 
     def test_empty_body_returns_empty_collections(self) -> None:
         client = MockClient()
@@ -654,26 +743,31 @@ class TestOnTradeUpdate:
         client.on_trade_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"")
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"")
         handler(result)
 
         callback.assert_called_once()
         data = callback.call_args[0][0]
         assert data["positions"] == []
         assert data["orders"] == []
+        assert data["deals"] == []
 
-    def test_malformed_body_logs_error(self) -> None:
+    def test_malformed_body_yields_no_trades(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
         client.on_trade_update(callback)
         handler = client.transport.on.call_args[0][1]
 
-        # 1-byte body triggers struct.error in on_trade_update (struct.unpack_from("<I", body, 0))
-        result = CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"\x01")
+        # 1-byte body: too short for the entry header.
+        result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"\x01")
         handler(result)
 
-        callback.assert_not_called()
+        # Nothing could be decoded, so no trade changed - the caller sees
+        # an empty delta instead of a broken book.
+        callback.assert_called_once()
+        data = callback.call_args[0][0]
+        assert data == {"positions": [], "orders": [], "deals": []}
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +1058,9 @@ class TestOnTradeResult:
 
 
 class TestOnTradeTransaction:
-    def test_balance_update_type_2(self) -> None:
+    """The raw view: one callback call per entry of the cmd=10 push."""
+
+    def test_a_deal_entry_carries_deal_position_and_balance(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
@@ -973,59 +1069,58 @@ class TestOnTradeTransaction:
         assert client.transport.on.call_args[0][0] == CMD_TRADE_UPDATE_PUSH
         handler = client.transport.on.call_args[0][1]
 
-        # type=2 is a balance update
-        update_type = struct.pack("<I", 2)
-        # Build a balance info section
-        from pymt5.schemas import TRADE_UPDATE_BALANCE_SCHEMA
-
-        balance_fields = []
-        for field in TRADE_UPDATE_BALANCE_SCHEMA:
-            entry = dict(field)
-            entry["propValue"] = 100.0  # some dummy balance value
-            balance_fields.append(entry)
-        balance_data = SeriesCodec.serialize(balance_fields)
-        # Add empty deals and positions (count=0 each)
-        empty_counted = struct.pack("<I", 0)
-        body = update_type + balance_data + empty_counted + empty_counted
-
+        body = _build_trade_update_body(
+            deal={"deal": 7, "trade_symbol": "EURUSD", "entry": 1},
+            position={"position_id": 42, "trade_symbol": "EURUSD",
+                      "trade_volume": 0},
+            balance={"balance": 100.0},
+        )
         result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
-        data = callback.call_args[0][0]
-        assert data["update_type"] == 2
-        assert "balance_info" in data
-        assert data["balance_info"]["balance"] == 100.0
+        entry = callback.call_args[0][0]
+        assert entry["entry_type"] == 2
+        assert entry["deal"]["deal"] == 7
+        assert entry["position"]["position_id"] == 42
+        # A closed position arrives with volume 0.
+        assert entry["position"]["closed"] is True
+        assert entry["balance"]["balance"] == 100.0
 
-    def test_order_transaction_type_not_2(self) -> None:
+    def test_an_order_entry_carries_the_order(self) -> None:
         client = MockClient()
         callback = MagicMock()
 
         client.on_trade_transaction(callback)
         handler = client.transport.on.call_args[0][1]
 
-        # type=0 is an order transaction (not balance update)
-        update_type = struct.pack("<I", 0)
-        # Build a transaction section
-        from pymt5.schemas import TRADE_TRANSACTION_SCHEMA
-
-        txn_fields = []
-        for field in TRADE_TRANSACTION_SCHEMA:
-            entry = dict(field)
-            entry["propValue"] = 1
-            txn_fields.append(entry)
-        txn_data = SeriesCodec.serialize(txn_fields)
-        body = update_type + txn_data
-
+        body = _build_trade_update_body(orders=[
+            (0, {"trade_order": 11, "trade_symbol": "EURUSD",
+                 "volume_current": 1000000}),
+        ])
         result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         callback.assert_called_once()
-        data = callback.call_args[0][0]
-        assert data["update_type"] == 0
-        assert data["flag_mask"] == 1
-        assert data["transaction_id"] == 1
-        assert data["transaction_type"] == 1
+        entry = callback.call_args[0][0]
+        assert entry["entry_type"] == 0
+        assert entry["order"]["trade_order"] == 11
+        assert entry["order"]["closed"] is False
+
+    def test_every_entry_is_delivered(self) -> None:
+        client = MockClient()
+        callback = MagicMock()
+
+        client.on_trade_transaction(callback)
+        handler = client.transport.on.call_args[0][1]
+
+        body = _build_trade_update_body(orders=[
+            (0, {"trade_order": 11}),
+            (1, {"trade_order": 11}),
+        ])
+        handler(CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body))
+
+        assert callback.call_count == 2
 
     def test_body_too_short_no_callback(self) -> None:
         client = MockClient()

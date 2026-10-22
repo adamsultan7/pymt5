@@ -517,22 +517,31 @@ BOOK_LEVEL_SCHEMA = [
 BOOK_LEVEL_FIELD_NAMES = ["price", "volume"]
 
 # ---------------------------------------------------------------------------
-# Trade Update Push (cmd 10, order transaction format)
-# Schema Zu in JS — used when type != 2
+# Trade Update Push (cmd 10)
+#
+# The frame is a SEQUENCE of entries. Every entry starts with a 12-byte
+# header; the payload that follows is selected by the header's type:
+#
+#   type 0 / 1 : ORDER record (356 bytes) - an order was created / filled
+#   type 2     : DEAL (356) + POSITION (344) + BALANCE (48)
+#
+# Verified against the live FP Markets demo server (build 6140) by
+# capturing the official Web Terminal's own cmd=10 frames and decoding
+# them against the known trade (ticket, symbol, volume, price, comment).
 # ---------------------------------------------------------------------------
-TRADE_TRANSACTION_SCHEMA = [
-    {"propType": PROP_U32},  # 0: flag_mask (0=open orders, 1=history orders, 2=deal)
-    {"propType": PROP_U32},  # 1: transaction_id
-    {"propType": PROP_U32},  # 2: transaction_type (0=add, 1=update, 2=delete)
+TRADE_UPDATE_ENTRY_SCHEMA = [
+    {"propType": PROP_U32},  # 0: entry type (0/1 = order event, 2 = deal+position)
+    {"propType": PROP_U32},  # 1: serial (monotonic per connection)
+    {"propType": PROP_U32},  # 2: action (0 = order placed, 2 = order filled)
 ]
 
-TRADE_TRANSACTION_FIELD_NAMES = [
-    "flag_mask",
-    "transaction_id",
-    "transaction_type",
+TRADE_UPDATE_ENTRY_FIELD_NAMES = [
+    "entry_type",
+    "serial",
+    "action",
 ]
 
-# Trade Update Push balance header (cmd 10, type == 2)
+# Trade Update Push balance block (cmd 10, type == 2, tail of the entry)
 TRADE_UPDATE_BALANCE_SCHEMA = [
     {"propType": PROP_F64},  # 0: balance
     {"propType": PROP_F64},  # 1: credit
@@ -1059,7 +1068,7 @@ _SCHEMA_PAIRS = [
     (SPREAD_SCHEMA, SPREAD_FIELD_NAMES, "SPREAD"),
     (BOOK_HEADER_SCHEMA, BOOK_HEADER_FIELD_NAMES, "BOOK_HEADER"),
     (BOOK_LEVEL_SCHEMA, BOOK_LEVEL_FIELD_NAMES, "BOOK_LEVEL"),
-    (TRADE_TRANSACTION_SCHEMA, TRADE_TRANSACTION_FIELD_NAMES, "TRADE_TRANSACTION"),
+    (TRADE_UPDATE_ENTRY_SCHEMA, TRADE_UPDATE_ENTRY_FIELD_NAMES, "TRADE_UPDATE_ENTRY"),
     (TRADE_UPDATE_BALANCE_SCHEMA, TRADE_UPDATE_BALANCE_FIELD_NAMES, "TRADE_UPDATE_BALANCE"),
     (SYMBOL_DETAILS_SCHEMA, SYMBOL_DETAILS_FIELD_NAMES, "SYMBOL_DETAILS"),
     (TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES, "TRADE_RESULT_PUSH"),

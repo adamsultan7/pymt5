@@ -1340,15 +1340,15 @@ def test_on_tick_parse_error():
 
 
 def test_on_position_update_parse_error():
-    """Cover lines 94-95: position update parse error branch."""
+    """A broken live push must be logged, never crash the receive loop."""
     client = MockPushClient()
     callback = MagicMock()
     client.on_position_update(callback)
     handler = _get_registered_handler(client)
 
-    # 1-byte body triggers struct.error in _parse_counted_records via struct.unpack_from
-    with patch("pymt5._push_handlers._parse_counted_records", side_effect=struct.error("bad")):
-        handler(CommandResult(command=CMD_GET_POSITIONS_ORDERS, code=0, body=b"\x00" * 100))
+    with patch("pymt5._push_handlers.parse_trade_update_push",
+               side_effect=struct.error("bad")):
+        handler(CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=b"\x00" * 100))
     callback.assert_not_called()
 
 

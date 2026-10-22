@@ -438,27 +438,20 @@ class TestTradeUpdatePushHandler:
 
         handler = mixin.on_trade_transaction(callback)
 
-        # Build a body for update_type != 2 (transaction path)
-        # The body structure is:
-        # [4 bytes: update_type] [TRADE_TRANSACTION_SCHEMA] [ORDER_SCHEMA]
+        # A cmd=10 order entry:
+        # [u32 entry_type][u32 serial][u32 action][ORDER record]
         order_size = get_series_size(ORDER_SCHEMA)
+        header = struct.pack("<III", 0, 42, 0)
+        body = header + bytes(order_size)
 
-        # update_type = 1 (not balance update)
-        update_type = struct.pack("<I", 1)
-        # Transaction data: flag_mask=0, transaction_id=42, transaction_type=0
-        txn_data = struct.pack("<III", 0, 42, 0)
-        # Order data: full order record (all zeros)
-        order_data = bytes(order_size)
-
-        body = update_type + txn_data + order_data
         result = CommandResult(command=CMD_TRADE_UPDATE_PUSH, code=0, body=body)
         handler(result)
 
         assert len(received) == 1
         data = received[0]
-        assert data["update_type"] == 1
+        assert data["entry_type"] == 0
         assert "order" in data
-        assert data["transaction_id"] == 42
+        assert data["serial"] == 42
 
 
 # =====================================================================
