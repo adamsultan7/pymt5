@@ -238,6 +238,15 @@ class SyncMT5Client:
     def get_full_symbol_info(self, symbol: str, timeout: float | None = None) -> Record | None:
         return self._call(self._client.get_full_symbol_info(symbol), timeout)
 
+    def market_session_open(self, symbol: str, at: datetime | None = None, timeout: float | None = None) -> bool | None:
+        """True/False/None: is this symbol tradable right now?
+
+        Same verdict the official Web Terminal's ``isMarketClosed`` makes
+        (the broker's trade sessions). None means "can't tell" - never
+        read it as closed.
+        """
+        return self._call(self._client.market_session_open(symbol, at), timeout)
+
     def symbol_info(self, symbol: str, timeout: float | None = None) -> Record | None:
         return self._call(self._client.symbol_info(symbol), timeout)
 
@@ -275,6 +284,14 @@ class SyncMT5Client:
 
     def unsubscribe_ticks(self, symbol_ids: list[int], timeout: float | None = None) -> None:
         self._call(self._client.unsubscribe_ticks(symbol_ids), timeout)
+
+    def force_resubscribe(self, symbol_ids: list[int], timeout: float | None = None) -> None:
+        """Drop and re-add the tick streams (revives a stalled stream)."""
+        self._call(self._client.force_resubscribe(symbol_ids), timeout)
+
+    def force_resubscribe_symbols(self, symbol_names: list[str], timeout: float | None = None) -> list[int]:
+        """``force_resubscribe`` by symbol name. Returns the symbol ids."""
+        return self._call(self._client.force_resubscribe_symbols(symbol_names), timeout)
 
     def subscribe_symbols(self, symbol_names: list[str], timeout: float | None = None) -> list[int]:
         return self._call(self._client.subscribe_symbols(symbol_names), timeout)

@@ -401,6 +401,16 @@ def _parse_tick_batch(
                         if prev != 0.0:
                             tick[key] = prev
 
+        # A side that is STILL 0 after the merge is unknown: the server
+        # pushes only the fields that changed and the client had no
+        # previous value to carry over (the first ticks after a
+        # subscribe). Such a quote is one-sided - not a price, the spread
+        # is unknown - so mark it instead of letting callers mistake it
+        # for a real quote (it read as a "closed market" downstream).
+        if (float(tick.get("bid", 0.0) or 0.0) <= 0
+                or float(tick.get("ask", 0.0) or 0.0) <= 0):
+            tick["partial"] = True
+
         ticks.append(tick)
     return ticks
 

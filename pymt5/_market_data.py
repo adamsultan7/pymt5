@@ -11,7 +11,7 @@ import asyncio
 import struct
 import time
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, TypeVar
 
 from pymt5._currency import _CurrencyMixin
@@ -45,6 +45,9 @@ from pymt5.constants import (
     PROP_FIXED_STRING,
     PROP_I32,
     PROP_U16,
+    SYMBOL_TRADE_MODE_CLOSEONLY,
+    SYMBOL_TRADE_MODE_DISABLED,
+    SYMBOL_TRADE_MODE_FULL,
 )
 from pymt5.exceptions import SymbolNotFoundError, ValidationError
 from pymt5.protocol import SeriesCodec, get_series_size
@@ -255,9 +258,80 @@ class _MarketDataMixin(_CurrencyMixin):
         }
 
     def symbol_info_tick(self, symbol: str) -> Record | None:
-        """Return the latest cached tick for a symbol if a tick stream has been seen."""
+        """Return the latest cached tick for a symbol if a tick stream has been seen.
+
+        The server pushes PARTIAL ticks (only the fields that changed);
+        the cache merges them with the previous values, so a complete
+        quote is returned whenever one was ever seen. A tick whose side
+        is still 0 after the merge is one-sided: ``partial`` is set on it
+        (it is not a usable price - the spread is unknown).
+        """
         tick = self._tick_cache_by_name.get(symbol)
         return dict(tick) if tick is not None else None
+
+    async def market_session_open(
+        self, symbol: str, at: datetime | None = None
+    ) -> bool | None:
+        """True/False/None: is this symbol tradable right now?
+
+        Uses the full symbol spec (the same ``trade_sessions`` data the
+        official Web Terminal's ``isMarketClosed`` runs on): the
+        trade_mode gate first (clock-free - disabled / close-only never
+        trades), then today's trade sessions against the SERVER wall
+        clock.
+
+        ``None`` means "can't tell" (the spec is unreadable, the clock is
+        unknown, or no sessions are published). Callers must treat None as
+        UNKNOWN, never as closed - a server that answers nothing (a 0-byte
+        cmd=18 body) must not be read as a closed market.
+        """
+        try:
+            spec = await self.get_full_symbol_info(symbol)
+        except Exception:
+            spec = None
+        if not spec:
+            return None
+        trade = spec.get("trade") or {}
+        raw_mode = trade.get("trade_mode", spec.get("trade_mode", 4))
+        try:
+            mode = int(raw_mode)
+        except (TypeError, ValueError):
+            mode = SYMBOL_TRADE_MODE_FULL
+        if mode in (SYMBOL_TRADE_MODE_DISABLED, SYMBOL_TRADE_MODE_CLOSEONLY):
+            return False
+        sessions = (spec.get("schedule") or {}).get("trade_sessions") or []
+        if not isinstance(sessions, list) or len(sessions) < 7:
+            return None
+        try:
+            if at is None:
+                shift = await self._server_shift_seconds()
+                at = datetime.now(timezone.utc) + timedelta(seconds=shift)
+            wd = (at.weekday() + 1) % 7      # the schedule is Sunday-first
+            mins = at.hour * 60 + at.minute
+            day = sessions[wd] or []
+        except Exception:
+            return None
+        for sess in day:
+            try:
+                start, end = int(sess[0]), int(sess[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if start == 0 and end == 0:
+                continue
+            if end <= start:                 # an overnight session
+                if mins >= start or mins < end:
+                    return True
+            elif start <= mins < end:
+                return True
+        return False
+
+    async def _server_shift_seconds(self) -> float:
+        """Broker clock offset (server wall - true UTC) in seconds."""
+        try:
+            acct = await self.get_account()
+            return float(acct.get("timezone_shift", 0) or 0)
+        except Exception:
+            return 0.0
 
     async def symbol_select(self, symbol: str, enable: bool = True) -> bool:
         """Best-effort official-style symbol selection via tick subscription."""
@@ -342,6 +416,35 @@ class _MarketDataMixin(_CurrencyMixin):
         removed_count = len(existing) - len(remaining)
         self._subscribed_ids = remaining
         logger.info("unsubscribed %d symbol ids from ticks (%d remaining)", removed_count, len(remaining))
+
+    async def force_resubscribe(self, symbol_ids: list[int]) -> None:
+        """Drop and re-add the tick streams (revives a stalled stream).
+
+        ``subscribe_ticks`` merges with the current set and the server
+        ignores a symbol it already streams, so a stream that stopped
+        arriving cannot be revived by subscribing again (the subscribe is
+        a no-op for an already-subscribed id). Dropping the id first
+        makes the server treat it as new and push the current tick again.
+        """
+        if not symbol_ids:
+            return
+        await self.unsubscribe_ticks(symbol_ids)
+        # Let the server drop the stream before asking again.
+        await asyncio.sleep(0.4)
+        await self.subscribe_ticks(symbol_ids)
+
+    async def force_resubscribe_symbols(self, symbol_names: list[str]) -> list[int]:
+        """``force_resubscribe`` by symbol name. Returns the symbol ids."""
+        ids: list[int] = []
+        for name in symbol_names or []:
+            try:
+                sid = await self._resolve_symbol_id(name)
+            except Exception:
+                sid = None
+            if sid is not None:
+                ids.append(sid)
+        await self.force_resubscribe(ids)
+        return ids
 
     async def subscribe_symbols(self, symbol_names: list[str]) -> list[int]:
         """Subscribe to tick updates by symbol name (requires load_symbols first).
