@@ -4,6 +4,8 @@ unsubscribe_ticks, and on_* handler return values."""
 
 import asyncio
 import struct
+import time
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -508,6 +510,119 @@ async def test_copy_rates_wrappers():
     client.get_rates.return_value = bars
     from_pos = await client.copy_rates_from_pos("EURUSD", 1, 1, 2)
     assert from_pos == bars[1:3]
+
+
+async def test_server_shift_prefers_effective_offset():
+    """DST-correct ``server_offset_time`` wins over the base ``timezone_shift``."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"timezone_shift": 7200, "server_offset_time": 10800})
+
+    assert await client.server_shift() == 10800.0
+
+
+async def test_server_shift_falls_back_to_timezone_shift():
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"timezone_shift": 7200})
+
+    assert await client.server_shift() == 7200.0
+
+
+async def test_server_shift_does_not_cache_a_failed_lookup():
+    """A transient account error must not pin the shift to zero for an hour."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(side_effect=RuntimeError("timeout"))
+    assert await client.server_shift() == 0.0
+
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    assert await client.server_shift() == 10800.0
+
+
+async def test_copy_rates_from_pos_anchors_at_server_wall_now():
+    """The current-bar window must end at server wall now, not at true UTC."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"timezone_shift": 7200, "server_offset_time": 10800})
+    client.get_rates = AsyncMock(return_value=[{"time": 1}, {"time": 2}])
+
+    before = int(time.time())
+    result = await client.copy_rates_from_pos("XAUUSD", 1, 0, 2)
+    after = int(time.time())
+
+    args = client.get_rates.await_args.args
+    assert args[0] == "XAUUSD"
+    assert args[1] == 1
+    assert before + 10800 <= args[3] <= after + 10800
+    assert result == [{"time": 1}, {"time": 2}]
+
+
+async def test_copy_rates_from_treats_naive_datetime_as_utc():
+    """The official-style date anchor is true UTC and is shifted to server wall."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    client.get_rates = AsyncMock(return_value=[])
+
+    anchor = datetime(2026, 10, 22, 13, 41, 7)
+    await client.copy_rates_from("XAUUSD", 1, anchor, 5)
+
+    args = client.get_rates.await_args.args
+    assert args[3] == int(anchor.replace(tzinfo=UTC).timestamp()) + 10800
+
+
+async def test_copy_rates_from_pos_does_not_retry_when_window_is_enough():
+    """The normal (market open) path stays a single history request."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    client.get_rates = AsyncMock(return_value=[{"time": t} for t in range(10)])
+
+    await client.copy_rates_from_pos("XAUUSD", 1, 1, 3)
+
+    assert client.get_rates.await_count == 1
+
+
+async def test_copy_rates_from_pos_widens_the_window_across_a_market_gap():
+    """An empty weekend window is retried with a much wider lookback."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    gap_bars = [{"time": 1}, {"time": 2}, {"time": 3}]
+    client.get_rates = AsyncMock(side_effect=[[], gap_bars])
+
+    result = await client.copy_rates_from_pos("XAUUSD", 1, 0, 2)
+
+    assert result == gap_bars[-2:]
+    assert client.get_rates.await_count == 2
+    first_from, first_to = client.get_rates.await_args_list[0].args[2:4]
+    second_from, second_to = client.get_rates.await_args_list[1].args[2:4]
+    assert second_to == first_to
+    assert first_to - second_from >= 24 * 60 * 60
+
+
+async def test_copy_rates_from_pos_stops_when_no_more_bars_exist():
+    """A symbol with no history must not burn every retry."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    client.get_rates = AsyncMock(return_value=[])
+
+    assert await client.copy_rates_from_pos("XAUUSD", 1, 1, 2) == []
+    assert client.get_rates.await_count == 2
+
+
+async def test_copy_rates_from_pos_caps_the_widened_window():
+    """M1 requests must not grow past the lookback ceiling."""
+    client = MT5WebClient()
+    client.get_account = AsyncMock(return_value={"server_offset_time": 10800})
+    # Short but non-empty every time, so the early "no progress" exit never fires.
+    client.get_rates = AsyncMock(
+        side_effect=[
+            [{"time": 1}],
+            [{"time": 1}, {"time": 2}],
+            [{"time": 1}, {"time": 2}, {"time": 3}],
+            [{"time": 1}, {"time": 2}, {"time": 3}, {"time": 4}],
+        ]
+    )
+
+    await client.copy_rates_from_pos("XAUUSD", 1, 0, 5)
+
+    windows = [c.args[3] - c.args[2] for c in client.get_rates.await_args_list]
+    assert max(windows) <= 7 * 24 * 60 * 60
 
 
 async def test_get_full_symbol_info_parses_extended_bond_fields():

@@ -143,12 +143,15 @@ Bars and Ticks
      - ``MT5WebClient.copy_rates_from()``
      - Derived
      - Fetches a bar range through ``cmd=11`` and slices the trailing
-       ``count`` locally.
+       ``count`` locally. ``date_from`` is a true-UTC instant; a naive
+       ``datetime`` is treated as UTC.
    * - ``copy_rates_from_pos()``
      - ``MT5WebClient.copy_rates_from_pos()``
      - Derived
      - Reconstructs current-bar-relative access by requesting enough history
-       and slicing in client code.
+       and slicing in client code. The window ends at the broker's server
+       wall clock (true UTC plus ``server_shift()``), matching the encoding
+       of bar ``time`` fields.
    * - ``copy_ticks_from()``
      - ``MT5WebClient.copy_ticks_from()``
      - Derived

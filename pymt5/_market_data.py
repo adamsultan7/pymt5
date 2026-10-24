@@ -11,7 +11,7 @@ import asyncio
 import struct
 import time
 import zlib
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, TypeVar
 
 from pymt5._currency import _CurrencyMixin
@@ -70,6 +70,14 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 logger = get_logger("pymt5.client")
+
+# copy_rates_from_pos emulates "position from the newest bar" with a time
+# window. Across a market gap (weekend, holiday) the natural window can be
+# empty or short, so it is widened up to _POSITION_LOOKBACK_TRIES times:
+# at least _POSITION_LOOKBACK_FLOOR seconds, never beyond the ceiling.
+_POSITION_LOOKBACK_FLOOR = 24 * 60 * 60
+_POSITION_LOOKBACK_CEIL = 7 * 24 * 60 * 60
+_POSITION_LOOKBACK_TRIES = 4
 
 
 class _MarketDataMixin(_CurrencyMixin):
@@ -305,7 +313,7 @@ class _MarketDataMixin(_CurrencyMixin):
         try:
             if at is None:
                 shift = await self._server_shift_seconds()
-                at = datetime.now(timezone.utc) + timedelta(seconds=shift)
+                at = datetime.now(UTC) + timedelta(seconds=shift)
             wd = (at.weekday() + 1) % 7      # the schedule is Sunday-first
             mins = at.hour * 60 + at.minute
             day = sessions[wd] or []
@@ -327,11 +335,7 @@ class _MarketDataMixin(_CurrencyMixin):
 
     async def _server_shift_seconds(self) -> float:
         """Broker clock offset (server wall - true UTC) in seconds."""
-        try:
-            acct = await self.get_account()
-            return float(acct.get("timezone_shift", 0) or 0)
-        except Exception:
-            return 0.0
+        return await self.server_shift()
 
     async def symbol_select(self, symbol: str, enable: bool = True) -> bool:
         """Best-effort official-style symbol selection via tick subscription."""
@@ -588,11 +592,17 @@ class _MarketDataMixin(_CurrencyMixin):
     async def get_rates(self, symbol: str, period_minutes: int, from_ts: int, to_ts: int) -> RecordList:
         """Get kline/rate bars.
 
+        Low-level ``cmd=11`` wrapper: ``from_ts``/``to_ts`` are SERVER-WALL
+        epochs (true UTC plus ``server_shift``), the same encoding the
+        returned bar ``time`` fields use. The official-style helpers
+        (``copy_rates_from`` / ``copy_rates_from_pos``) take true-UTC
+        inputs and convert here.
+
         Args:
             symbol: Symbol name, e.g. "EURUSD"
             period_minutes: Bar period in minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 43200)
-            from_ts: Start time as UNIX seconds
-            to_ts: End time as UNIX seconds
+            from_ts: Start time as UNIX seconds on the SERVER wall clock
+            to_ts: End time as UNIX seconds on the SERVER wall clock
 
         Returns:
             List of bar dicts with keys: time, open, high, low, close, tick_volume, spread, real_volume
@@ -630,7 +640,12 @@ class _MarketDataMixin(_CurrencyMixin):
         date_from: int | float | datetime,
         date_to: int | float | datetime,
     ) -> RecordList:
-        """Official-style range wrapper for cmd=11 bars."""
+        """Official-style range wrapper for cmd=11 bars.
+
+        Thin protocol-level wrapper: ``date_from``/``date_to`` are
+        SERVER-WALL epochs, matching ``get_rates``. Use
+        ``copy_rates_from_pos`` for current-bar-relative access.
+        """
         period_minutes = _normalize_timeframe_minutes(timeframe)
         return await self.get_rates(
             symbol,
@@ -646,11 +661,18 @@ class _MarketDataMixin(_CurrencyMixin):
         date_from: int | float | datetime,
         count: int,
     ) -> RecordList:
-        """Best-effort official-style wrapper returning bars up to date_from."""
+        """Best-effort official-style wrapper returning bars up to date_from.
+
+        ``date_from`` follows the official API and is a TRUE-UTC instant
+        (a naive ``datetime`` is treated as UTC). cmd=11 itself speaks
+        server-wall epochs, so the anchor is converted here.
+        """
         if count <= 0:
             return []
         period_minutes = _normalize_timeframe_minutes(timeframe)
-        end_ts = _coerce_timestamp(date_from)
+        if isinstance(date_from, datetime) and date_from.tzinfo is None:
+            date_from = date_from.replace(tzinfo=UTC)
+        end_ts = _coerce_timestamp(date_from) + int(await self._server_shift_seconds())
         lookback = _history_lookback_seconds(period_minutes, count)
         bars = await self.get_rates(symbol, period_minutes, max(0, end_ts - lookback), end_ts)
         return bars[-count:]
@@ -662,15 +684,38 @@ class _MarketDataMixin(_CurrencyMixin):
         start_pos: int,
         count: int,
     ) -> RecordList:
-        """Best-effort current-bar-relative wrapper built on cmd=11 history."""
+        """Best-effort current-bar-relative wrapper built on cmd=11 history.
+
+        The anchor is the server's wall clock (true UTC plus the broker
+        offset): cmd=11 treats ``from``/``to`` as server-wall epochs, so
+        requesting the local/UTC "now" would return bars ending
+        ``server_shift`` seconds in the past (3 hours on a UTC+3 broker).
+
+        Position is emulated with a time window rather than a server-side
+        offset, so a market gap (weekend, holiday) can leave the window
+        empty or short. The window is widened a few times in that case
+        before returning what exists.
+        """
         if start_pos < 0:
             raise ValidationError(f"start_pos must be >= 0, got {start_pos}")
         if count <= 0:
             return []
         period_minutes = _normalize_timeframe_minutes(timeframe)
-        end_ts = int(datetime.now().timestamp())
-        lookback = _history_lookback_seconds(period_minutes, start_pos + count)
-        bars = await self.get_rates(symbol, period_minutes, max(0, end_ts - lookback), end_ts)
+        needed = start_pos + count
+        end_ts = int(time.time()) + int(await self._server_shift_seconds())
+        lookback = _history_lookback_seconds(period_minutes, needed)
+        ceiling = max(lookback, _POSITION_LOOKBACK_CEIL)
+        bars: RecordList = []
+        previous = -1
+        for _ in range(_POSITION_LOOKBACK_TRIES):
+            bars = await self.get_rates(symbol, period_minutes, max(0, end_ts - lookback), end_ts)
+            if len(bars) >= needed or lookback >= ceiling:
+                break
+            wider = min(ceiling, max(lookback * 4, _POSITION_LOOKBACK_FLOOR))
+            if wider <= lookback or len(bars) <= previous:
+                break
+            previous = len(bars)
+            lookback = wider
         if not bars:
             return []
         end_index = max(0, len(bars) - start_pos)

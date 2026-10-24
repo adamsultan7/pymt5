@@ -1,6 +1,27 @@
 Changelog
 =========
 
+v1.1.0 (unreleased)
+-------------------
+
+- Fixed ``copy_rates_from_pos()`` returning bars up to ``server_shift``
+  seconds in the past. It anchored the ``cmd=11`` window at true UTC, but
+  ``cmd=11`` treats ``from``/``to`` as server-wall epochs, so on a UTC+3
+  broker the "current" bar was three hours stale. The window now ends at
+  server wall now.
+- ``copy_rates_from()`` converts its true-UTC anchor to server wall, and
+  treats a naive ``datetime`` as UTC instead of the local timezone.
+- ``server_shift()`` now prefers ``server_offset_time`` (the DST-correct
+  effective offset) over ``timezone_shift`` (the base offset), so the
+  reported shift is no longer an hour short during daylight time.
+- Documented that ``get_rates()`` and ``copy_rates_range()`` take
+  server-wall epochs; they are unchanged.
+- ``copy_rates_from_pos()`` now widens its history window when a market
+  gap (weekend, holiday) leaves it empty or short, instead of returning
+  fewer bars than requested or nothing at all. It stops widening as soon
+  as a request brings no additional bars, and caps the lookback at seven
+  days.
+
 v1.0.0 (2026-03-21)
 --------------------
 

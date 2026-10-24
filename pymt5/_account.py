@@ -6,9 +6,8 @@ account opening, OTP setup, notifications, and corporate links.
 
 from __future__ import annotations
 
-import time
-
 import struct
+import time
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pymt5._logging import get_logger
@@ -125,6 +124,11 @@ class _AccountMixin:
     async def server_shift(self) -> float:
         """Broker clock offset (server wall - true UTC) in seconds.
 
+        Prefer ``server_offset_time``: it is the effective offset
+        (``timezone_shift`` plus the DST hour), while ``timezone_shift``
+        alone is the base offset and is an hour short whenever the broker
+        is on daylight time (e.g. 7200 vs the real 10800 in summer).
+
         Web ticks carry the SERVER wall time as an epoch, so freshness has
         to be measured against the server clock - a UTC box would read
         every tick as hours stale. Cached for an hour.
@@ -133,12 +137,16 @@ class _AccountMixin:
         cached = getattr(self, "_server_shift_cache", None)
         if cached and now - cached[0] < 3600:
             return cached[1]
-        shift = 0.0
         try:
             acct = await self.get_account()
-            shift = float(acct.get("timezone_shift", 0) or 0)
+            value = acct.get("server_offset_time")
+            if value is None:
+                value = acct.get("timezone_shift", 0)
+            shift = float(value or 0)
         except Exception:
-            shift = 0.0
+            # Do not cache a failed lookup: caching 0 here would silently
+            # put every bar request an offset behind for the next hour.
+            return 0.0
         self._server_shift_cache = (now, shift)
         return shift
 
